@@ -699,6 +699,12 @@ JsonNode *mcp_tools_call_node(const char *name, JsonObject *arguments, gboolean 
     if(!g_strcmp0(name, _handlers[i].name))
     {
       if(found) *found = TRUE;
+      gboolean own_arguments = FALSE;
+      if(!arguments)
+      {
+        arguments = json_object_new();
+        own_arguments = TRUE;
+      }
       if(_tools_meta)
       {
         JsonArray *metadata = json_node_get_array(_tools_meta);
@@ -716,12 +722,15 @@ JsonNode *mcp_tools_call_node(const char *name, JsonObject *arguments, gboolean 
           {
             JsonNode *result = _text_result(err, TRUE);
             g_free(err);
+            if(own_arguments) json_object_unref(arguments);
             return result;
           }
           break;
         }
       }
-      return _handlers[i].fn(arguments);
+      JsonNode *result = _handlers[i].fn(arguments);
+      if(own_arguments) json_object_unref(arguments);
+      return result;
     }
   }
   if(found) *found = FALSE;

@@ -43,6 +43,7 @@
 #include <cairo/cairo.h>
 #include <json-glib/json-glib.h>
 #include <glib/gstdio.h>
+#include <errno.h>
 #include <limits.h>
 #include <sqlite3.h>
 #include <stdlib.h>
@@ -794,14 +795,16 @@ char *dt_bridge_image_parameters_json(const char *path, int imgid_in, char **err
   for(GList *it = dev.iop; it; it = g_list_next(it))
   {
     dt_iop_module_t *mod = it->data;
-    if(!mod || !mod->so || !mod->so->get_introspection
-       || !mod->so->have_introspection) continue;
-    dt_introspection_t *intro = mod->so->get_introspection();
+    if(!mod || !mod->so) continue;
+    dt_introspection_t *intro = mod->so->have_introspection && mod->so->get_introspection
+      ? mod->so->get_introspection() : NULL;
     json_builder_begin_object(b);
     json_builder_set_member_name(b, "operation");
     json_builder_add_string_value(b, mod->so->op);
     json_builder_set_member_name(b, "params_version");
-    json_builder_add_int_value(b, intro->params_version);
+    json_builder_add_int_value(b, mod->so->version ? mod->so->version() : -1);
+    json_builder_set_member_name(b, "have_introspection");
+    json_builder_add_boolean_value(b, intro != NULL);
     json_builder_set_member_name(b, "multi_priority");
     json_builder_add_int_value(b, mod->multi_priority);
     json_builder_set_member_name(b, "enabled");
@@ -814,9 +817,16 @@ char *dt_bridge_image_parameters_json(const char *path, int imgid_in, char **err
       json_builder_add_string_value(b, mod->multi_name);
     }
     json_builder_set_member_name(b, "values");
-    dt_mcp_params_values(b, intro->field, mod->params);
+    if(intro) dt_mcp_params_values(b, intro->field, mod->params);
+    else json_builder_add_null_value(b);
     json_builder_set_member_name(b, "defaults");
-    dt_mcp_params_values(b, intro->field, mod->default_params);
+    if(intro) dt_mcp_params_values(b, intro->field, mod->default_params);
+    else json_builder_add_null_value(b);
+    if(!intro)
+    {
+      json_builder_set_member_name(b, "unsupported");
+      json_builder_add_string_value(b, "module has no parameter introspection");
+    }
     json_builder_end_object(b);
   }
   json_builder_end_array(b);
@@ -1201,6 +1211,11 @@ static gboolean _prepare_stage(dt_mcp_stage_t *stage, const char *baseline,
                                JsonArray *stack, gboolean disable_tone_mappers,
                                int *history_end, char **err)
 {
+  if(baseline && *history_end != -1)
+  {
+    _seterr(err, "raw-development baseline requires history_end=-1");
+    return FALSE;
+  }
   dt_develop_t dev;
   dt_dev_init(&dev, FALSE);
   dt_dev_load_image(&dev, stage->imgid);
@@ -2561,6 +2576,35 @@ static dt_imageio_module_format_t *_pick_format(const char *format_name,
   return fmt;
 }
 
+typedef struct dt_mcp_export_t
+{
+  dt_mcp_stage_t stage;
+  gchar *target;
+  gchar *temporary;
+  gchar *backup;
+  gboolean published;
+} dt_mcp_export_t;
+
+static gboolean _export_backup(dt_mcp_export_t *item, char **err)
+{
+  GStatBuf metadata;
+  if(g_lstat(item->target, &metadata))
+  {
+    if(errno == ENOENT) return TRUE;
+    _seterr(err, "could not inspect existing export output '%s'", item->target);
+    return FALSE;
+  }
+  item->backup = g_strconcat(item->target, ".mcp-backup-XXXXXX", NULL);
+  const int fd = g_mkstemp(item->backup);
+  if(fd >= 0) close(fd);
+  if(fd < 0 || g_unlink(item->backup) || link(item->target, item->backup))
+  {
+    _seterr(err, "could not preserve existing export output '%s'", item->target);
+    return FALSE;
+  }
+  return TRUE;
+}
+
 gboolean dt_bridge_export_images(const char *in_path, int imgid_in,
                                  int width, int height,
                                  int history_end, const char *out_path,
@@ -2643,6 +2687,7 @@ gboolean dt_bridge_export_images(const char *in_path, int imgid_in,
                                               g_free, NULL);
   gboolean all_ok = TRUE;
   int seq = 1;
+  GArray *prepared = g_array_sized_new(FALSE, TRUE, sizeof(dt_mcp_export_t), g_list_length(l));
   GList *untried = NULL;
   for(GList *i = l; i; i = g_list_next(i), seq++)
   {
@@ -2667,35 +2712,91 @@ gboolean dt_bridge_export_images(const char *in_path, int imgid_in,
     }
     g_hash_table_add(claimed, g_strdup(target));
 
-    dt_mcp_stage_t stage;
+    dt_mcp_export_t item = { .stage = { .imgid = NO_IMGID }, .target = target };
+    g_array_append_val(prepared, item);
+    dt_mcp_export_t *pending = &g_array_index(prepared, dt_mcp_export_t, prepared->len - 1);
     int prepared_history_end = history_end;
     const gboolean edits = baseline || (stack && json_array_get_length(stack));
-    all_ok = _stage_begin(id, sc.active, baseline, edits, &stage, err);
-    gchar *temporary = NULL;
-    if(all_ok) all_ok = _prepare_stage(&stage, baseline, stack, FALSE,
+    all_ok = _stage_begin(id, sc.active, baseline, edits, &pending->stage, err);
+    if(all_ok) all_ok = _prepare_stage(&pending->stage, baseline, stack, FALSE,
                                       &prepared_history_end, err);
     if(all_ok && _ensure_parent_dir(target, err))
     {
-      temporary = g_strconcat(target, ".mcp-XXXXXX", NULL);
-      const int fd = g_mkstemp(temporary);
+      pending->temporary = g_strconcat(target, ".mcp-XXXXXX", NULL);
+      const int fd = g_mkstemp(pending->temporary);
       if(fd < 0) { _seterr(err, "could not create private export output"); all_ok = FALSE; }
       else close(fd);
     }
     else all_ok = FALSE;
-    if(all_ok) all_ok = _write_export(stage.imgid, temporary, fmt, quality, width, height,
+    if(all_ok) all_ok = _write_export(pending->stage.imgid, pending->temporary, fmt, quality, width, height,
                                       prepared_history_end, upscale, high_quality, bpp,
                                       icc_file, !g_strcmp0(format_name, "scene-linear-tiff"), err);
-    if(all_ok) all_ok = _stage_commit(&stage, temporary, target, err);
-    if(temporary) { g_unlink(temporary); g_free(temporary); }
-    _stage_discard(&stage);
-    if(!all_ok) { untried = g_list_next(i); g_free(target); break; }
-    if(written) g_ptr_array_add(written, g_strdup(target));
-    g_free(target);
+    if(!all_ok) { untried = g_list_next(i); break; }
   }
 
-  // the batch stops at the first failure, and the caller is told only which
-  // files were written; without this the images after it go unmentioned and
-  // read as if they had been exported
+  // retain prior outputs until the whole request's catalog changes can commit
+  sqlite3 *db = dt_database_get(darktable.db);
+  gboolean committing = FALSE;
+  if(all_ok)
+  {
+    committing = sqlite3_exec(db, "SAVEPOINT mcp_export", NULL, NULL, NULL) == SQLITE_OK;
+    all_ok = committing;
+    if(!all_ok) _seterr(err, "could not start export publication");
+  }
+  for(guint i = 0; all_ok && i < prepared->len; i++)
+  {
+    dt_mcp_export_t *item = &g_array_index(prepared, dt_mcp_export_t, i);
+    all_ok = _export_backup(item, err);
+    if(all_ok)
+    {
+      all_ok = _stage_commit(&item->stage, item->temporary, item->target, err);
+      item->published = !g_file_test(item->temporary, G_FILE_TEST_EXISTS);
+    }
+  }
+  if(committing)
+  {
+    if(all_ok && sqlite3_exec(db, "RELEASE mcp_export", NULL, NULL, NULL) != SQLITE_OK)
+    {
+      _seterr(err, "could not commit export publication");
+      all_ok = FALSE;
+    }
+    if(!all_ok)
+    {
+      sqlite3_exec(db, "ROLLBACK TO mcp_export", NULL, NULL, NULL);
+      sqlite3_exec(db, "RELEASE mcp_export", NULL, NULL, NULL);
+    }
+  }
+  if(all_ok && written)
+    for(guint i = 0; i < prepared->len; i++)
+      g_ptr_array_add(written, g_strdup(g_array_index(prepared, dt_mcp_export_t, i).target));
+  for(guint i = prepared->len; i > 0; i--)
+  {
+    dt_mcp_export_t *item = &g_array_index(prepared, dt_mcp_export_t, i - 1);
+    if(!all_ok && item->published)
+    {
+      const int restored = item->backup ? g_rename(item->backup, item->target) : g_unlink(item->target);
+      if(restored)
+      {
+        if(err)
+        {
+          gchar *message = g_strdup_printf("%s; could not restore output '%s'%s%s",
+            *err ? *err : "export failed", item->target,
+            item->backup ? "; retained prior output at " : "", item->backup ? item->backup : "");
+          g_free(*err);
+          *err = message;
+        }
+        g_free(item->backup);
+        item->backup = NULL;
+      }
+    }
+    if(item->temporary) { g_unlink(item->temporary); g_free(item->temporary); }
+    if(item->backup) { g_unlink(item->backup); g_free(item->backup); }
+    g_free(item->target);
+    _stage_discard(&item->stage);
+  }
+  g_array_free(prepared, TRUE);
+
+  // the batch stops at its first failure and publishes no partial result
   if(!all_ok && untried && err && *err)
   {
     GString *m = g_string_new(*err);

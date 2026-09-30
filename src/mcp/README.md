@@ -167,7 +167,7 @@ Standard MCP handshake over stdio, both newline-delimited JSON (default) and
 | `module_schema` | `{operation}` | recursive schema including nested structs, arrays, string constraints, ranges, enum symbols/descriptions, and explicit unsupported kinds |
 | `decode_params` | `{operation, blob_hex, params_version}` | `{operation, version, fields:{…}}`; size and version must both match |
 | `encode_params` | `{operation, fields:{…}}` | `{operation, blob_hex}` — strict typed validation, no coercion |
-| `image_parameters` | `{input:{path\|imgid}}` | initialized module values, reset defaults, instance identities, and `iop_order` |
+| `image_parameters` | `{input:{path\|imgid}}` | initialized values, reset defaults, instance identities, and `iop_order`; non-introspected instances carry null values and an explicit unsupported reason |
 `doc_url` is the module's page in the darktable usermanual — fetch it for prose
 docs on what each parameter means.
 
@@ -207,35 +207,34 @@ for working on one.
 | `render` | `{input:{path\|imgid}, width?, height?, stack?, disable_tone_mappers?, history_end?}` | MCP image content (base64 PNG) |
 | `image_stats` | same as `render` | per-channel `{min, max, mean, p1, p50, p99, clip_lo, clip_hi}` |
 
-A `stack` is an array of `{operation, params:{…} | blob_hex, multi_priority?, enabled?}`
-applied on top of the image's base pipeline. `disable_tone_mappers:true` switches
-off whichever tone mapper darktable auto-applies (whatever
-`plugins/darkroom/workflow` selects) so that one you add in the stack owns the
-tone curve — and, like a stack, that switch is written to the image's history and
-sidecar, so it outlives the request.
+A `stack` is an array of `{operation, params:{…} | blob_hex, params_version?,
+multi_priority?, enabled?}` applied to an isolated image state. Omitted fields
+retain their initialized or current values. Binary parameters require the
+current version from `module_schema`; equal-sized older versions are refused.
+Invalid types, unknown fields or enums, fractional integers, malformed arrays,
+and unsupported strings fail without changing the source image's history.
 
-A stack entry may carry `before` or `after` naming another module, which places
-it at that point in the pipeline — relative rather than a raw `iop_order`, which
-is an opaque number nobody can choose sensibly. `get_history` reports each
-module's `iop_order` so you can read the current arrangement first; note that a
-history entry's `num` is the order edits were *made*, which is a different thing.
+`disable_tone_mappers:true` disables the auto-applied tone mapper before applying
+the stack. `baseline:"raw-development"` instead starts from native RAW camera
+initialization and suppresses artistic defaults. This baseline requires
+`history_end:-1` and a supported RAW input.
 
-**A stack is written to the image.** For an `imgid` it becomes the image's
-history, and the XMP sidecar follows where the library's preference allows —
-there is no throwaway duplicate, so a render is also how you commit an edit.
-`history_end` selects how much of the existing history to keep before the stack
-is layered on. Run with `--read-only`, or against an in-memory library, when that
-is not what you want.
+A stack entry may carry `before` or `after` naming another module. Native
+ordering rules determine whether the move is legal. An absent `multi_priority`
+instance is created only when the module supports multiple instances.
+`image_parameters` reports initialized values, reset defaults, and the actual
+instance order without committing history.
 
-`history_end` deserves care on `render` and `image_stats`: **with a stack it
-rewrites the image's history**, dropping entries past `history_end` for good,
-because the base state is truncated before the stack is written on top. Without
-a stack it only selects what to render and changes nothing, which is also all it
-ever does in `export_images`.
+`render`, `image_stats`, and `export_images` share preparation. For `input.imgid`,
+requested edits commit only after the output succeeds. Failure restores the
+prior catalog state, including an undeveloped image's empty history. For
+`input.path`, the image and its request history remain temporary. External XMP
+loading and writing are suppressed for these processing requests.
 
-On a scratch render the stack still shapes the pixels you get back, but nothing
-survives the request — which is what makes `image_stats` usable for comparing
-parameters without leaving a trail.
+`history_end` selects the base history before applying intent. With a stack,
+successful catalog processing replaces the selected history with the result;
+without intent, it only selects what to process. Read-only catalog processing
+refuses edits but permits inspection and output from unchanged history.
 
 ### Configuration
 
@@ -305,9 +304,9 @@ rather than the existing file overwritten. The setting decides what happens to
 files that were on disk before the export; two sources of one batch that resolve
 to the same target always take separate names whatever it says, since letting
 one image overwrite another's output would lose it. The directory is created if
-it does not exist. A batch stops at the first image it cannot write, and the error names
-both the files already on disk and the images that were never attempted, so a
-retry neither duplicates nor skips.
+it does not exist. A batch stops at its first failure. Outputs and history are
+published only after every selected image prepares and writes successfully.
+Failure restores prior outputs and history; the error names unattempted images.
 
 **Where exports go.** Name `out_path` (one image) or `out_dir` (several), or
 name neither and darktable decides, exactly as its own export module would:
@@ -325,17 +324,13 @@ succeeded. Only a file that was already there is skipped, never a name another
 image of the same call has just taken. An `out_path` you named yourself is never
 subject to the policy.
 
-**Export takes no edits.** Unlike `render`, `export_images` takes no `stack` and
-no `disable_tone_mappers` and refuses a request carrying either: both are
-committed to the image's history, so accepting them would make writing a JPEG
-quietly alter the image it came from. Edit first
-(`render` with a stack, or `apply_style`), then export. `history_end` is safe
-and does stay, because it only selects how much of the existing history to
-apply and changes nothing. Exporting an image that has never been developed
-still materializes darktable's auto-applied history, exactly as `render` does
-(see [Notes & limitations](#notes--limitations)); `--read-only` takes that back.
-Omitting `width`/`height` exports at full resolution, as darktable's own export
-does.
+**Export before render.** `export_images` accepts the same `stack`, baseline,
+and history selection as `render`, and needs no prior render to materialize
+intent. Omit `width` and `height` for full resolution. For
+`format:"scene-linear-tiff"`, provide `icc_file` naming a profile registered in
+`configdir/color/out`; the native writer uses float32 scene-linear RGB and
+refuses a missing profile instead of silently choosing sRGB. Negative and
+over-range samples remain representable.
 
 **Formats.** `format` picks the output module — `jpeg`, `png`, `tiff`, `webp`,
 `jxl`, `avif`, `exr`, `pfm`, `ppm`, `j2k`, whichever your build has (`jpg` and
@@ -405,22 +400,15 @@ handler is ignored with a warning on stderr.
   cairo wrapper and crashes without a GUI).
 - **First render** of a raw runs demosaic + the full pipe and can take a few
   seconds; give clients a generous timeout.
-- **Version upgrades:** `decode_params` currently requires the blob to match the
-  module's current param size. Feeding older-version blobs through
-  `dt_iop_legacy_params` first is a planned addition.
-- **Edits persist for `imgid` input.** A `stack` is committed to the image's
-  history, so an agent exploring variants leaves the last one applied, with no
-  undo. `reset_history` clears an image; `--read-only` or an in-memory library
-  prevents writes. Scratch renders (`input.path`) keep nothing by design.
-- **A first render materializes the auto-applied history.** An image whose
-  history is empty comes back with a dozen entries after any `render`,
-  `image_stats` or `export_images`, with no `stack` in the request: darktable
-  writes out the modules `plugins/darkroom/workflow` auto-applies the first time
-  the pipeline runs on that image, and syncs the sidecar with them.
-  `darktable-cli` does exactly the same, so this is darktable's own default
-  rendering being recorded rather than an edit the server made. Run with
-  `--read-only` if you need the image left alone: it holds back the `.xmp` and
-  clears that history again before the request returns.
+- **Version upgrades:** binary parameter blobs must match both the current
+  version and size. Older desktop history layouts are explicitly refused;
+  this boundary performs no legacy migration.
+- **Successful catalog edits persist.** `input.imgid` commits requested edits
+  after output success. `input.path` discards request state. `--read-only`
+  refuses catalog edits and does not substitute scratch semantics.
+- **Inspection and output without edits preserve history.** Engine initialization
+  occurs on an isolated row; it does not materialize auto-applied history on the
+  catalog source. Processing ignores ambient XMP and suppresses sidecar writes.
 - **A crash mid-request can strand a scratch row**, since cleanup runs when the
   request finishes. It shows up as an unexpected image in the catalog.
 - Not included: driving a live/open darktable GUI (this is a background worker).

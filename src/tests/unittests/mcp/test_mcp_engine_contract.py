@@ -22,10 +22,11 @@ except ImportError as exc:
 
 
 class McpClient:
-    def __init__(self, binary, config, read_only=False):
+    def __init__(self, binary, config, read_only=False, overwrite=False):
         self.proc = subprocess.Popen(
             [binary, *(["--read-only"] if read_only else []), "--core", "--disable-opencl",
              "--configdir", str(config), "--cachedir", str(config / "cache"),
+             *(["--conf", "plugins/imageio/storage/disk/overwrite=1"] if overwrite else []),
              "--library", str(config / "library.db"),
              "--conf", "plugins/darkroom/workflow=none",
              "--conf", "write_sidecar_files=never",
@@ -151,6 +152,80 @@ class EngineContract(unittest.TestCase):
             "input": {"imgid": image_id}, "out_path": str(target), "format": "scene-linear-tiff",
             "bpp": 32, "icc_file": self.icc, "stack": stack,
         })
+
+    def test_omitted_arguments_dispatch_and_required_fields(self):
+        omitted = self.client.call("tools/call", {"name": "list_modules"})
+        explicit = self.client.call("tools/call", {"name": "list_modules", "arguments": {}})
+        self.assertEqual(omitted, explicit)
+        self.assertFalse(omitted["isError"])
+        required = self.client.call("tools/call", {"name": "module_schema"})
+        self.assertTrue(required["isError"])
+        self.assertIn("required argument", required["content"][0]["text"])
+        self.assertEqual(self.client.call("tools/call", {"name": "list_modules"}), explicit)
+
+    def test_image_context_includes_unsupported_module_instances(self):
+        image_id = self.import_source()
+        inventory = self.client.tool("list_modules", {})
+        unsupported = {module["operation"] for module in inventory if not module["have_introspection"]}
+        self.assertTrue(unsupported)
+        before = self.snapshot()
+        context = self.client.tool("image_parameters", {"input": {"imgid": image_id}})
+        modules = {module["operation"]: module for module in context["modules"]}
+        self.assertTrue(unsupported <= modules.keys())
+        for operation in unsupported:
+            module = modules[operation]
+            self.assertFalse(module["have_introspection"])
+            self.assertIsNone(module["values"])
+            self.assertIsNone(module["defaults"])
+            self.assertIn("unsupported", module)
+            self.assertIsInstance(module["iop_order"], int)
+            self.assertIsInstance(module["multi_priority"], int)
+        self.assertEqual(before, self.snapshot())
+
+    def test_raw_baseline_refuses_history_truncation(self):
+        image_id = self.import_source()
+        before = self.snapshot()
+        for history_end in (0, 1):
+            arguments = {"input": {"imgid": image_id}, "baseline": "raw-development",
+                         "history_end": history_end, "stack": []}
+            for tool in ("render", "image_stats", "export_images"):
+                request = dict(arguments)
+                target = self.config / "invalid-baseline.tiff"
+                if tool == "export_images":
+                    request.update(out_path=str(target), format="scene-linear-tiff", icc_file=self.icc)
+                self.assertIn("history_end=-1", self.client.tool_error(tool, request))
+                self.assertEqual(before, self.snapshot())
+                self.assertFalse(target.exists())
+
+    def test_batch_failure_restores_all_outputs_and_catalog_state(self):
+        first = self.import_source()
+        second_source = self.source.with_name("second.tiff")
+        shutil.copyfile(self.source, second_source)
+        second = self.client.tool("import_images", {"paths": [str(second_source)]})["images"][0]["imgid"]
+        self.client.close()
+        self.client = McpClient(self.binary, self.config, overwrite=True)
+        stack = [{"operation": "exposure", "params": {"exposure": 1.0}}]
+        outputs = self.config / "batch"
+        outputs.mkdir()
+        first_output = outputs / "synthetic.tif"
+        first_output.write_bytes(b"prior exported image")
+        first_before = fingerprint(first_output)
+        before = self.snapshot()
+        second_source.unlink()
+        self.client.tool_error("export_images", {"imgids": [first, second], "out_dir": str(outputs),
+                              "format": "scene-linear-tiff", "icc_file": self.icc, "stack": stack})
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(first_before, fingerprint(first_output))
+        self.assertEqual(set(outputs.iterdir()), {first_output})
+        shutil.copyfile(self.source, second_source)
+        second_output = outputs / "second.tif"
+        second_output.mkdir()
+        self.client.tool_error("export_images", {"imgids": [first, second], "out_dir": str(outputs),
+                              "format": "scene-linear-tiff", "icc_file": self.icc, "stack": stack})
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(first_before, fingerprint(first_output))
+        self.assertEqual(set(outputs.iterdir()), {first_output, second_output})
+        self.assertEqual(list(second_output.iterdir()), [])
 
     def test_recursive_codec_and_validation(self):
         modules = self.client.tool("list_modules", {})
