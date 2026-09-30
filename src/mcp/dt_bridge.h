@@ -34,25 +34,28 @@ char *dt_bridge_list_modules_json(void);
 /** JSON description of a module's parameter layout (fields, ranges, doc_url) */
 char *dt_bridge_module_schema_json(const char *op, char **err);
 
-/** decode a hex op_params blob into a JSON { field: value } object */
-char *dt_bridge_decode_params_json(const char *op, const char *blob_hex, char **err);
+/** decode a versioned hex op_params blob into a JSON object */
+char *dt_bridge_decode_params_json(const char *op, const char *blob_hex,
+                                   int params_version, char **err);
+
+/** Read initialized module values, reset defaults, identities, and ordering. */
+char *dt_bridge_image_parameters_json(const char *path, int imgid_in, char **err);
 
 /** seed a module's defaults, apply `fields` (a JsonObject*, void* to keep this
     header light), and return a hex op_params blob */
 char *dt_bridge_encode_params_hex(const char *op, void *fields_jsonobject, char **err);
 
-/** render a raw (by path or imgid) through the base pipeline plus an optional
-    module `stack` (JsonArray*), on a throwaway duplicate so the source is
-    untouched; on success hands back a g_malloc'd PNG in png_out / png_len */
+/** Prepare an isolated request, render a PNG, then commit catalog intent on success.
+    Original bytes and external sidecars remain untouched. */
 gboolean dt_bridge_render_png(const char *path, int imgid_in, int width, int height,
-                              void *stack_jsonarray, gboolean disable_tone_mappers,
-                              int history_end, uint8_t **png_out, size_t *png_len,
-                              char **err);
+                              const char *baseline, void *stack_jsonarray,
+                              gboolean disable_tone_mappers, int history_end,
+                              uint8_t **png_out, size_t *png_len, char **err);
 
 /** like render, but returns per-channel statistics as JSON instead of a PNG */
 char *dt_bridge_image_stats_json(const char *path, int imgid_in, int width, int height,
-                                 void *stack_jsonarray, gboolean disable_tone_mappers,
-                                 int history_end, char **err);
+                                 const char *baseline, void *stack_jsonarray,
+                                 gboolean disable_tone_mappers, int history_end, char **err);
 
 // --- library (catalog) tools ---
 
@@ -84,8 +87,7 @@ char *dt_bridge_get_conf_json(const char *key, char **err);
 /** every declared configuration key, optionally filtered by prefix */
 char *dt_bridge_list_conf_json(const char *prefix);
 
-/** refuse every tool that edits the library, and roll back the history
-    darktable auto-applies the first time it renders an undeveloped image */
+/** Refuse catalog edits; render and export initialize only isolated request rows. */
 void dt_bridge_set_read_only(const gboolean on);
 
 /** clear an image's edit history */
@@ -115,6 +117,8 @@ gboolean dt_bridge_export_images(const char *in_path, int imgid_in,
                                  int history_end, const char *out_path,
                                  void *imgids_jsonarray, const char *out_dir,
                                  const char *format_name, int quality,
+                                 int bpp, const char *icc_file,
+                                 const char *baseline, void *stack_jsonarray,
                                  gboolean upscale, gboolean high_quality,
                                  void *written_paths, void *skipped_paths,
                                  char **err);

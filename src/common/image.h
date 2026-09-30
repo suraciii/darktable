@@ -479,6 +479,9 @@ dt_imgid_t dt_image_import(dt_filmid_t film_id,
                            const char *filename,
                            const gboolean override_ignore_nonraws,
                            const gboolean raise_signals);
+/** imports one image without reading or writing external sidecars */
+dt_imgid_t dt_image_import_no_sidecars(const dt_filmid_t film_id,
+                                      const char *filename);
 /** imports a new image from raw/etc file and adds it to the data base
  * and image cache. Use from lua thread.*/
 dt_imgid_t dt_image_import_lua(const dt_filmid_t film_id,

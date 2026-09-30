@@ -15,7 +15,7 @@
     You should have received a copy of the GNU General Public License
     along with darktable.  If not, see <http://www.gnu.org/licenses/>.
 */
-
+#include "mcp/mcp_params.h"
 #include "mcp/dt_bridge.h"
 
 #include "common/colorspaces.h"
@@ -42,6 +42,7 @@
 
 #include <cairo/cairo.h>
 #include <json-glib/json-glib.h>
+#include <glib/gstdio.h>
 #include <limits.h>
 #include <sqlite3.h>
 #include <stdlib.h>
@@ -127,153 +128,6 @@ static void _add_doc_url(JsonBuilder *b, const char *op)
   }
 }
 
-static const char *_type_name(dt_introspection_type_t t)
-{
-  switch(t)
-  {
-    case DT_INTROSPECTION_TYPE_FLOAT:  return "float";
-    case DT_INTROSPECTION_TYPE_DOUBLE: return "double";
-    case DT_INTROSPECTION_TYPE_INT:    return "int";
-    case DT_INTROSPECTION_TYPE_UINT:   return "uint";
-    case DT_INTROSPECTION_TYPE_INT8:   return "int8";
-    case DT_INTROSPECTION_TYPE_UINT8:  return "uint8";
-    case DT_INTROSPECTION_TYPE_SHORT:  return "short";
-    case DT_INTROSPECTION_TYPE_USHORT: return "ushort";
-    case DT_INTROSPECTION_TYPE_BOOL:   return "bool";
-    case DT_INTROSPECTION_TYPE_ENUM:   return "enum";
-    default:                           return "other";
-  }
-}
-
-// is this a flat scalar leaf we can read/write generically?
-static gboolean _is_scalar(dt_introspection_type_t t)
-{
-  switch(t)
-  {
-    case DT_INTROSPECTION_TYPE_FLOAT:
-    case DT_INTROSPECTION_TYPE_DOUBLE:
-    case DT_INTROSPECTION_TYPE_INT:
-    case DT_INTROSPECTION_TYPE_UINT:
-    case DT_INTROSPECTION_TYPE_INT8:
-    case DT_INTROSPECTION_TYPE_UINT8:
-    case DT_INTROSPECTION_TYPE_SHORT:
-    case DT_INTROSPECTION_TYPE_USHORT:
-    case DT_INTROSPECTION_TYPE_BOOL:
-    case DT_INTROSPECTION_TYPE_ENUM:
-      return TRUE;
-    default:
-      return FALSE;
-  }
-}
-
-// read the scalar at p (of introspection type t) and add it to the builder
-static void _add_value(JsonBuilder *b, dt_introspection_field_t *f, const void *p)
-{
-  switch(f->header.type)
-  {
-    case DT_INTROSPECTION_TYPE_FLOAT:
-      json_builder_add_double_value(b, *(const float *)p);
-      break;
-    case DT_INTROSPECTION_TYPE_DOUBLE:
-      json_builder_add_double_value(b, *(const double *)p);
-      break;
-    case DT_INTROSPECTION_TYPE_INT:
-      json_builder_add_int_value(b, *(const int *)p);
-      break;
-    case DT_INTROSPECTION_TYPE_UINT:
-      json_builder_add_int_value(b, *(const unsigned int *)p);
-      break;
-    case DT_INTROSPECTION_TYPE_INT8:
-      json_builder_add_int_value(b, *(const int8_t *)p);
-      break;
-    case DT_INTROSPECTION_TYPE_UINT8:
-      json_builder_add_int_value(b, *(const uint8_t *)p);
-      break;
-    case DT_INTROSPECTION_TYPE_SHORT:
-      json_builder_add_int_value(b, *(const short *)p);
-      break;
-    case DT_INTROSPECTION_TYPE_USHORT:
-      json_builder_add_int_value(b, *(const unsigned short *)p);
-      break;
-    case DT_INTROSPECTION_TYPE_BOOL:
-      json_builder_add_boolean_value(b, (*(const gboolean *)p) != 0);
-      break;
-    case DT_INTROSPECTION_TYPE_ENUM:
-    {
-      const int v = *(const int *)p;
-      const char *name = NULL;
-      for(dt_introspection_type_enum_tuple_t *e = f->Enum.values; e && e->name; e++)
-        if(e->value == v) { name = e->name; break; }
-      if(name) json_builder_add_string_value(b, name);
-      else     json_builder_add_int_value(b, v);
-      break;
-    }
-    default:
-      json_builder_add_null_value(b);
-      break;
-  }
-}
-
-// write default value of a scalar field into blob at p
-static void _write_default(dt_introspection_field_t *f, void *p)
-{
-  switch(f->header.type)
-  {
-    case DT_INTROSPECTION_TYPE_FLOAT:  *(float *)p = f->Float.Default; break;
-    case DT_INTROSPECTION_TYPE_DOUBLE: *(double *)p = f->Double.Default; break;
-    case DT_INTROSPECTION_TYPE_INT:    *(int *)p = f->Int.Default; break;
-    case DT_INTROSPECTION_TYPE_UINT:   *(unsigned int *)p = f->UInt.Default; break;
-    case DT_INTROSPECTION_TYPE_INT8:   *(int8_t *)p = f->Int8.Default; break;
-    case DT_INTROSPECTION_TYPE_UINT8:  *(uint8_t *)p = f->UInt8.Default; break;
-    case DT_INTROSPECTION_TYPE_SHORT:  *(short *)p = f->Short.Default; break;
-    case DT_INTROSPECTION_TYPE_USHORT: *(unsigned short *)p = f->UShort.Default; break;
-    case DT_INTROSPECTION_TYPE_BOOL:   *(gboolean *)p = f->Bool.Default; break;
-    case DT_INTROSPECTION_TYPE_ENUM:   *(int *)p = f->Enum.Default; break;
-    default: break;
-  }
-}
-
-// the bounds module_schema publishes. a field whose source carries no range
-// comment gets its type's full range (introspection.h:77), so this only ever
-// rejects what a module actually declares out of bounds
-static gboolean _num_in_range(dt_introspection_field_t *f, const double num,
-                              double *lo, double *hi)
-{
-  *lo = 0.0;
-  *hi = 0.0;
-  switch(f->header.type)
-  {
-    case DT_INTROSPECTION_TYPE_FLOAT:  *lo = f->Float.Min;  *hi = f->Float.Max;  break;
-    case DT_INTROSPECTION_TYPE_DOUBLE: *lo = f->Double.Min; *hi = f->Double.Max; break;
-    case DT_INTROSPECTION_TYPE_INT:    *lo = f->Int.Min;    *hi = f->Int.Max;    break;
-    case DT_INTROSPECTION_TYPE_UINT:   *lo = f->UInt.Min;   *hi = f->UInt.Max;   break;
-    case DT_INTROSPECTION_TYPE_INT8:   *lo = f->Int8.Min;   *hi = f->Int8.Max;   break;
-    case DT_INTROSPECTION_TYPE_UINT8:  *lo = f->UInt8.Min;  *hi = f->UInt8.Max;  break;
-    case DT_INTROSPECTION_TYPE_SHORT:  *lo = f->Short.Min;  *hi = f->Short.Max;  break;
-    case DT_INTROSPECTION_TYPE_USHORT: *lo = f->UShort.Min; *hi = f->UShort.Max; break;
-    default: return TRUE;   // bool and enum carry no range
-  }
-  return num >= *lo && num <= *hi;
-}
-
-static void _write_num(dt_introspection_field_t *f, void *p, double num)
-{
-  switch(f->header.type)
-  {
-    case DT_INTROSPECTION_TYPE_FLOAT:  *(float *)p = (float)num; break;
-    case DT_INTROSPECTION_TYPE_DOUBLE: *(double *)p = num; break;
-    case DT_INTROSPECTION_TYPE_INT:    *(int *)p = (int)num; break;
-    case DT_INTROSPECTION_TYPE_UINT:   *(unsigned int *)p = (unsigned int)num; break;
-    case DT_INTROSPECTION_TYPE_INT8:   *(int8_t *)p = (int8_t)num; break;
-    case DT_INTROSPECTION_TYPE_UINT8:  *(uint8_t *)p = (uint8_t)num; break;
-    case DT_INTROSPECTION_TYPE_SHORT:  *(short *)p = (short)num; break;
-    case DT_INTROSPECTION_TYPE_USHORT: *(unsigned short *)p = (unsigned short)num; break;
-    case DT_INTROSPECTION_TYPE_BOOL:   *(gboolean *)p = (num != 0.0); break;
-    case DT_INTROSPECTION_TYPE_ENUM:   *(int *)p = (int)num; break;
-    default: break;
-  }
-}
-
 static char *_builder_to_string(JsonBuilder *b)
 {
   JsonNode *root = json_builder_get_root(b);
@@ -320,15 +174,13 @@ char *dt_bridge_module_schema_json(const char *op, char **err)
     _seterr(err, "unknown module operation '%s'", op ? op : "(null)");
     return NULL;
   }
-  if(!so->have_introspection || !so->get_introspection || !so->get_introspection_linear)
+  if(!so->have_introspection || !so->get_introspection
+     || !so->get_introspection_linear)
   {
     _seterr(err, "module '%s' has no introspection", op);
     return NULL;
   }
-
   dt_introspection_t *intro = so->get_introspection();
-  dt_introspection_field_t *lin = so->get_introspection_linear();
-
   JsonBuilder *b = json_builder_new();
   json_builder_begin_object(b);
   json_builder_set_member_name(b, "operation");
@@ -338,97 +190,26 @@ char *dt_bridge_module_schema_json(const char *op, char **err)
   json_builder_set_member_name(b, "params_size");
   json_builder_add_int_value(b, (gint64)intro->size);
   _add_doc_url(b, so->op);
-  json_builder_set_member_name(b, "fields");
-  json_builder_begin_array(b);
-
-  for(dt_introspection_field_t *f = lin;
-      f && f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
-  {
-    if(!_is_scalar(f->header.type)) continue;  // skip root struct / arrays / unions
-    json_builder_begin_object(b);
-    json_builder_set_member_name(b, "name");
-    json_builder_add_string_value(b, f->header.field_name);
-    json_builder_set_member_name(b, "type");
-    json_builder_add_string_value(b, _type_name(f->header.type));
-    json_builder_set_member_name(b, "offset");
-    json_builder_add_int_value(b, (gint64)f->header.offset);
-    switch(f->header.type)
-    {
-      case DT_INTROSPECTION_TYPE_FLOAT:
-        json_builder_set_member_name(b, "min");
-        json_builder_add_double_value(b, f->Float.Min);
-        json_builder_set_member_name(b, "max");
-        json_builder_add_double_value(b, f->Float.Max);
-        json_builder_set_member_name(b, "default");
-        json_builder_add_double_value(b, f->Float.Default);
-        break;
-      case DT_INTROSPECTION_TYPE_INT:
-        json_builder_set_member_name(b, "min");
-        json_builder_add_int_value(b, f->Int.Min);
-        json_builder_set_member_name(b, "max");
-        json_builder_add_int_value(b, f->Int.Max);
-        json_builder_set_member_name(b, "default");
-        json_builder_add_int_value(b, f->Int.Default);
-        break;
-      case DT_INTROSPECTION_TYPE_UINT:
-        json_builder_set_member_name(b, "min");
-        json_builder_add_int_value(b, f->UInt.Min);
-        json_builder_set_member_name(b, "max");
-        json_builder_add_int_value(b, f->UInt.Max);
-        json_builder_set_member_name(b, "default");
-        json_builder_add_int_value(b, f->UInt.Default);
-        break;
-      case DT_INTROSPECTION_TYPE_BOOL:
-        json_builder_set_member_name(b, "default");
-        json_builder_add_boolean_value(b, f->Bool.Default != 0);
-        break;
-      case DT_INTROSPECTION_TYPE_ENUM:
-        json_builder_set_member_name(b, "default");
-        json_builder_add_int_value(b, f->Enum.Default);
-        json_builder_set_member_name(b, "values");
-        json_builder_begin_array(b);
-        for(dt_introspection_type_enum_tuple_t *e = f->Enum.values; e && e->name; e++)
-        {
-          json_builder_begin_object(b);
-          json_builder_set_member_name(b, "name");
-          json_builder_add_string_value(b, e->name);
-          json_builder_set_member_name(b, "value");
-          json_builder_add_int_value(b, e->value);
-          json_builder_end_object(b);
-        }
-        json_builder_end_array(b);
-        break;
-      default: break;
-    }
-    json_builder_end_object(b);
-  }
-
-  json_builder_end_array(b);
+  json_builder_set_member_name(b, "schema");
+  dt_mcp_params_schema(b, intro->field);
   json_builder_end_object(b);
   char *out = _builder_to_string(b);
   g_object_unref(b);
   return out;
 }
 
-// write a { field: value, ... } object for all scalar fields of `blob`
+// serialize the complete params tree, including nested arrays and structs
 static void _write_fields_object(dt_iop_module_so_t *so, const void *blob,
                                  JsonBuilder *b)
 {
-  dt_introspection_field_t *lin = so->get_introspection_linear();
-  json_builder_begin_object(b);
-  for(dt_introspection_field_t *f = lin;
-      f && f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
-  {
-    if(!_is_scalar(f->header.type)) continue;
-    void *p = so->get_p((void *)blob, f->header.name);
-    if(!p) continue;
-    json_builder_set_member_name(b, f->header.field_name);
-    _add_value(b, f, p);
-  }
-  json_builder_end_object(b);
+  dt_introspection_t *intro = so->get_introspection();
+  dt_mcp_params_values(b, intro->field, blob);
 }
 
-char *dt_bridge_decode_params_json(const char *op, const char *blob_hex, char **err)
+
+
+char *dt_bridge_decode_params_json(const char *op, const char *blob_hex,
+                                   int params_version, char **err)
 {
   dt_iop_module_so_t *so = _find_so(op);
   if(!so)
@@ -447,10 +228,16 @@ char *dt_bridge_decode_params_json(const char *op, const char *blob_hex, char **
   if(!blob) { _seterr(err, "invalid hex blob"); return NULL; }
 
   dt_introspection_t *intro = so->get_introspection();
+  if(params_version <= 0 || params_version != intro->params_version)
+  {
+    _seterr(err, "module '%s' requires params_version %d, got %d",
+            op, intro->params_version, params_version);
+    g_free(blob);
+    return NULL;
+  }
   if(blen != intro->size)
   {
-    _seterr(err, "blob size %zu != module '%s' params size %zu"
-                 " (version mismatch? pass the current version)",
+    _seterr(err, "blob size %zu != module '%s' params size %zu",
             blen, op, intro->size);
     g_free(blob);
     return NULL;
@@ -472,99 +259,26 @@ char *dt_bridge_decode_params_json(const char *op, const char *blob_hex, char **
   return out;
 }
 
-// build a params blob from `defaults`, then overwrite the named fields.
-// `defaults` is NULL when there is no module instance to take them from
+// build a params blob from defaults, then validate and apply a complete JSON tree
 static uint8_t *_seed_and_apply(dt_iop_module_so_t *so, const void *defaults,
                                 JsonObject *fields, size_t *size, char **err)
 {
   dt_introspection_t *intro = so->get_introspection();
-  dt_introspection_field_t *lin = so->get_introspection_linear();
-
-  uint8_t *blob = g_malloc0(intro->size);
-
-  if(defaults)
+  if(!defaults)
   {
-    // arrays and curve nodes come across intact, so having one no longer
-    // rules out setting a module's scalar fields by name
-    memcpy(blob, defaults, intro->size);
+    _seterr(err, "module '%s' has no initialized parameter block", so->op);
+    return NULL;
   }
-  else
-  {
-    // only scalar defaults are reachable here, and a non-scalar left at
-    // zero would be worse than refusing
-    for(dt_introspection_field_t *f = lin;
-        f && f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
-      if(!_is_scalar(f->header.type) && f->header.size != intro->size)
-      {
-        _seterr(err, "module '%s' has non-scalar parameters; pass a full blob_hex"
-                     " instead of fields", so->op);
-        g_free(blob);
-        return NULL;
-      }
-
-    for(dt_introspection_field_t *f = lin;
-        f && f->header.type != DT_INTROSPECTION_TYPE_NONE; f++)
-    {
-      if(!_is_scalar(f->header.type)) continue;
-      void *p = so->get_p(blob, f->header.name);
-      if(p) _write_default(f, p);
-    }
-  }
-
+  uint8_t *blob = g_malloc(intro->size);
+  memcpy(blob, defaults, intro->size);
   if(fields)
   {
-    GList *members = json_object_get_members(fields);
-    for(GList *it = members; it; it = g_list_next(it))
-    {
-      const char *name = (const char *)it->data;
-      dt_introspection_field_t *f = so->get_f(name);
-      if(!f || !_is_scalar(f->header.type))
-      {
-        _seterr(err, "unknown or non-scalar field '%s' for module '%s'", name, so->op);
-        g_list_free(members);
-        g_free(blob);
-        return NULL;
-      }
-      void *p = so->get_p(blob, f->header.name);
-      if(!p) continue;
-      JsonNode *node = json_object_get_member(fields, name);
-      if(f->header.type == DT_INTROSPECTION_TYPE_ENUM
-         && json_node_get_value_type(node) == G_TYPE_STRING)
-      {
-        const char *sym = json_node_get_string(node);
-        int val = 0;
-        gboolean found = FALSE;
-        for(dt_introspection_type_enum_tuple_t *e = f->Enum.values; e && e->name; e++)
-          if(!g_strcmp0(e->name, sym)) { val = e->value; found = TRUE; break; }
-        if(!found)
-        {
-          _seterr(err, "unknown enum value '%s' for field '%s'", sym, name);
-          g_list_free(members);
-          g_free(blob);
-          return NULL;
-        }
-        *(int *)p = val;
-      }
-      else
-      {
-        // refuse rather than clamp: a silently corrected value would render
-        // fine and leave the caller believing the number they sent was used
-        const double num = json_node_get_double(node);
-        double lo = 0.0, hi = 0.0;
-        if(!_num_in_range(f, num, &lo, &hi))
-        {
-          _seterr(err, "field '%s' of module '%s' is %g, outside its range"
-                       " [%g, %g] (see module_schema)", name, so->op, num, lo, hi);
-          g_list_free(members);
-          g_free(blob);
-          return NULL;
-        }
-        _write_num(f, p, num);
-      }
-    }
-    g_list_free(members);
+    JsonNode *node = json_node_new(JSON_NODE_OBJECT);
+    json_node_set_object(node, fields);
+    const gboolean ok = dt_mcp_params_apply(intro->field, blob, node, err);
+    json_node_free(node);
+    if(!ok) { g_free(blob); return NULL; }
   }
-
   *size = intro->size;
   return blob;
 }
@@ -583,8 +297,17 @@ char *dt_bridge_encode_params_hex(const char *op, void *fields_jsonobject, char 
     return NULL;
   }
 
+  dt_iop_module_t *module = calloc(1, sizeof(*module));
+  if(dt_iop_load_module(module, so, NULL))
+  {
+    _seterr(err, "could not initialize module '%s'", op);
+    return NULL;
+  }
   size_t size = 0;
-  uint8_t *blob = _seed_and_apply(so, NULL, (JsonObject *)fields_jsonobject, &size, err);
+  uint8_t *blob = _seed_and_apply(so, module->default_params,
+                                 (JsonObject *)fields_jsonobject, &size, err);
+  dt_iop_cleanup_module(module);
+  free(module);
   if(!blob) return NULL;
   char *hex = _bytes_to_hex(blob, size);
   g_free(blob);
@@ -637,77 +360,6 @@ static gboolean _film_is_empty(dt_filmid_t filmid)
     sqlite3_finalize(st);
   }
   return empty;
-}
-
-// where the rows an import is about to create begin. -1 when the catalog could
-// not be asked: 0 is a real answer (an empty library), and sharing the two
-// would make every row in a roll look new
-static dt_imgid_t _max_image_id(void)
-{
-  sqlite3 *db = dt_database_get(darktable.db);
-  sqlite3_stmt *st = NULL;
-  dt_imgid_t high = -1;
-  if(db && sqlite3_prepare_v2(db, "SELECT IFNULL(MAX(id), 0) FROM main.images",
-                              -1, &st, NULL) == SQLITE_OK)
-  {
-    if(sqlite3_step(st) == SQLITE_ROW) high = sqlite3_column_int(st, 0);
-    sqlite3_finalize(st);
-  }
-  return high;
-}
-
-// every row filed under `filmid` after `since`. one dt_image_import() adds more
-// than the image asked for: _image_read_duplicates() (image.c:2068) files a row
-// per "<name>_NN.<ext>.xmp" sidecar. db is a parameter so the tests can drive it
-static GList *_film_images_since(sqlite3 *db, dt_filmid_t filmid, dt_imgid_t since)
-{
-  // a negative baseline is _max_image_id() saying it could not answer, and
-  // "every row in the roll" is the one reply that must never be guessed:
-  // _drop_scratch() would delete the user's own images
-  if(since < 0) return NULL;
-
-  GList *out = NULL;
-  sqlite3_stmt *st = NULL;
-  if(db && sqlite3_prepare_v2(db,
-        "SELECT id FROM main.images WHERE film_id = ?1 AND id > ?2 ORDER BY id",
-        -1, &st, NULL) == SQLITE_OK)
-  {
-    sqlite3_bind_int(st, 1, filmid);
-    sqlite3_bind_int(st, 2, since);
-    while(sqlite3_step(st) == SQLITE_ROW)
-      out = g_list_prepend(out, GINT_TO_POINTER(sqlite3_column_int(st, 0)));
-    sqlite3_finalize(st);
-  }
-  return g_list_reverse(out);
-}
-
-// nothing filed for this image but its own row. that is the one state the first
-// pipeline run only adds to, so taking back what it added restores the image
-// exactly; anywhere else a rollback would lose work
-static gboolean _image_is_undeveloped(sqlite3 *db, dt_imgid_t imgid)
-{
-  sqlite3_stmt *st = NULL;
-  gboolean bare = FALSE;
-  if(db && sqlite3_prepare_v2(db,
-        "SELECT i.history_end, i.flags,"
-        "       (SELECT COUNT(*) FROM main.history WHERE imgid = i.id)"
-        "     + (SELECT COUNT(*) FROM main.masks_history WHERE imgid = i.id)"
-        "     + (SELECT COUNT(*) FROM main.module_order WHERE imgid = i.id)"
-        "     + (SELECT COUNT(*) FROM main.history_hash WHERE imgid = i.id)"
-        " FROM main.images i"
-        " WHERE i.id = ?1",
-        -1, &st, NULL) == SQLITE_OK)
-  {
-    sqlite3_bind_int(st, 1, imgid);
-    // a query that could not run leaves this FALSE: nothing is rolled back
-    // that was not first read back
-    if(sqlite3_step(st) == SQLITE_ROW)
-      bare = sqlite3_column_int(st, 0) == 0
-          && !(sqlite3_column_int(st, 1) & DT_IMAGE_AUTO_PRESETS_APPLIED)
-          && sqlite3_column_int(st, 2) == 0;
-    sqlite3_finalize(st);
-  }
-  return bare;
 }
 
 // the catalog matches on the literal folder string (image.c:2138) and
@@ -801,25 +453,11 @@ static dt_imgid_t _import_file(const char *path, dt_filmid_t *created_film,
     return NO_IMGID;
   }
 
-  // dt_image_import() hands back the existing id when the file is already in
-  // the library, and the caller must not then delete the user's image
   const gboolean had_image = dt_is_valid_imgid(dt_image_get_id_full_path(path));
-  const dt_imgid_t high = _max_image_id();
-  const dt_imgid_t id = dt_image_import(filmid, path, TRUE, FALSE);
+  const dt_imgid_t id = dt_image_import_no_sidecars(filmid, path);
   if(created_image) *created_image = dt_is_valid_imgid(id) && !had_image;
-  // sidecar duplicates are rows of their own, so the caller owns all of them.
-  // with no baseline it can only prove it owns the one id: a stale row left
-  // behind beats sweeping the roll blind and deleting pre-existing images
   if(created_ids && dt_is_valid_imgid(id) && !had_image)
-  {
-    if(high >= 0)
-      *created_ids = _film_images_since(dt_database_get(darktable.db), filmid, high);
-    // the row just filed is always above the baseline, so an empty answer is
-    // the query failing, not the roll being bare. owning nothing would leave
-    // the scratch row behind and refuse every later render of that path
-    if(!*created_ids)
-      *created_ids = g_list_prepend(NULL, GINT_TO_POINTER(id));
-  }
+    *created_ids = g_list_prepend(NULL, GINT_TO_POINTER(id));
   if(!dt_is_valid_imgid(id))
   {
     _seterr(err, "could not import '%s'", path);
@@ -898,7 +536,7 @@ static dt_imgid_t _resolve_input(const char *path, int imgid_in,
   if(dt_is_valid_imgid(existing))
   {
     _seterr(err, "'%s' is already in the catalog as imgid %d: use input.imgid %d"
-            " instead, where edits persist and the sidecar follows; add"
+            " instead, where successful edits persist; add"
             " history_end 0 to that call to ignore its existing edits",
             path, existing, existing);
     return NO_IMGID;
@@ -962,67 +600,387 @@ static void _drop_scratch(dt_mcp_scratch_t *sc)
   _xmp_unmute(&sc->mute);
 }
 
-// under --read-only an image has to come back as it was, and the first pipeline
-// run on an undeveloped one writes out the auto-applied modules
-// (develop.c:2246 sets the flag, :2847 writes the history)
-typedef struct dt_mcp_pristine_t
+typedef struct dt_mcp_stage_t
 {
-  dt_imgid_t imgid;         // NO_IMGID unless this request owes a rollback
+  dt_imgid_t source;
+  dt_imgid_t imgid;
+  gboolean commit;
   dt_mcp_xmp_mute_t mute;
-} dt_mcp_pristine_t;
+} dt_mcp_stage_t;
 
-// arm the rollback, if this run is one that needs it
-static void _pristine_hold(dt_imgid_t imgid, dt_mcp_pristine_t *pr)
+static gboolean _stage_sql(const char *sql, dt_imgid_t dest, dt_imgid_t source, char **err)
 {
-  pr->imgid = NO_IMGID;
-  pr->mute.saved = NULL;
-  pr->mute.active = FALSE;
-  if(!_read_only
-     || !dt_is_valid_imgid(imgid)
-     || !_image_is_undeveloped(dt_database_get(darktable.db), imgid))
-    return;
-
-  pr->imgid = imgid;
-  // develop.c:2867 only reaches for the sidecar when the mode is "on import",
-  // so muting keeps the auto-applied history off disk in the first place
-  _xmp_mute(&pr->mute);
+  sqlite3 *db = dt_database_get(darktable.db);
+  sqlite3_stmt *stmt = NULL;
+  gboolean ok = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK;
+  if(ok)
+  {
+    sqlite3_bind_int(stmt, 1, dest);
+    if(sqlite3_bind_parameter_count(stmt) > 1) sqlite3_bind_int(stmt, 2, source);
+    ok = sqlite3_step(stmt) == SQLITE_DONE;
+  }
+  sqlite3_finalize(stmt);
+  if(!ok && err && !*err) _seterr(err, "request catalog operation failed: %s", sqlite3_errmsg(db));
+  return ok;
 }
 
-// take back what the pipeline auto-applied
-static void _pristine_release(dt_mcp_pristine_t *pr)
+static gboolean _stage_copy_history(dt_imgid_t dest, dt_imgid_t source, char **err)
 {
-  if(dt_is_valid_imgid(pr->imgid))
+  const char *queries[] = {
+    "DELETE FROM main.history WHERE imgid=?1",
+    "INSERT INTO main.history (imgid,num,module,operation,op_params,enabled,blendop_params,"
+      "blendop_version,multi_priority,multi_name,multi_name_hand_edited)"
+      " SELECT ?1,num,module,operation,op_params,enabled,blendop_params,blendop_version,"
+      "multi_priority,multi_name,multi_name_hand_edited FROM main.history WHERE imgid=?2",
+    "DELETE FROM main.masks_history WHERE imgid=?1",
+    "INSERT INTO main.masks_history (imgid,num,formid,form,name,version,points,points_count,source)"
+      " SELECT ?1,num,formid,form,name,version,points,points_count,source"
+      " FROM main.masks_history WHERE imgid=?2",
+    "DELETE FROM main.module_order WHERE imgid=?1",
+    "INSERT INTO main.module_order (imgid,version,iop_list)"
+      " SELECT ?1,version,iop_list FROM main.module_order WHERE imgid=?2",
+    "DELETE FROM main.history_hash WHERE imgid=?1",
+    "INSERT INTO main.history_hash (imgid,current_hash)"
+      " SELECT ?1,current_hash FROM main.history_hash WHERE imgid=?2"
+  };
+  for(size_t i = 0; i < G_N_ELEMENTS(queries); i++)
+    if(!_stage_sql(queries[i], dest, source, err)) return FALSE;
+  return TRUE;
+}
+
+static void _stage_discard(dt_mcp_stage_t *stage)
+{
+  if(dt_is_valid_imgid(stage->imgid))
   {
-    // init_history FALSE keeps this off _remove_preset_flag()'s sidecar-writing
-    // cache release (history.c:57), which the mute above cannot reach: it asks
-    // for the write whatever the mode is. the flag it clears is cleared here
-    dt_history_delete_on_image_ext(pr->imgid, FALSE, FALSE);
-    dt_image_t *img = dt_image_cache_get(pr->imgid, 'w');
-    if(img)
-    {
-      img->flags &= ~DT_IMAGE_AUTO_PRESETS_APPLIED;
-      dt_image_cache_write_release(img, DT_IMAGE_CACHE_RELAXED);
-    }
-    pr->imgid = NO_IMGID;
+    // A native duplicate adjusts sibling versions and grouping. This row owns neither.
+    dt_image_cache_remove(stage->imgid);
+    dt_mipmap_cache_remove(stage->imgid);
+    _stage_sql("DELETE FROM main.module_order WHERE imgid=?1", stage->imgid, 0, NULL);
+    _stage_sql("DELETE FROM main.images WHERE id=?1", stage->imgid, 0, NULL);
+    stage->imgid = NO_IMGID;
   }
-  _xmp_unmute(&pr->mute);
+  _xmp_unmute(&stage->mute);
+}
+
+static gboolean _stage_begin(dt_imgid_t source, gboolean scratch, const char *baseline,
+                              gboolean edits, dt_mcp_stage_t *stage, char **err)
+{
+  *stage = (dt_mcp_stage_t){ .source = source, .imgid = NO_IMGID,
+                            .commit = edits && !scratch && !_read_only };
+  if(baseline && strcmp(baseline, "raw-development"))
+  {
+    _seterr(err, "baseline must be 'raw-development'");
+    return FALSE;
+  }
+  if(_read_only && edits && !scratch)
+  {
+    _seterr(err, "server is --read-only: applying intent would modify image %d", source);
+    return FALSE;
+  }
+  _xmp_mute(&stage->mute);
+  sqlite3 *db = dt_database_get(darktable.db);
+  if(sqlite3_exec(db, "SAVEPOINT mcp_stage", NULL, NULL, NULL) != SQLITE_OK)
+  {
+    _seterr(err, "could not start request catalog operation");
+    _stage_discard(stage);
+    return FALSE;
+  }
+  const char *clone =
+    "INSERT INTO main.images (group_id,film_id,width,height,filename,"
+      "maker_id,model_id,lens_id,camera_id,exposure,aperture,iso,focal_length,focus_distance,"
+      "datetime_taken,flags,output_width,output_height,crop,raw_parameters,raw_black,raw_maximum,"
+      "orientation,longitude,latitude,altitude,color_matrix,colorspace,version,max_version,"
+      "history_end,position,aspect_ratio,exposure_bias,whitebalance_id,flash_id,"
+      "exposure_program_id,metering_mode_id)"
+    " SELECT NULL,film_id,width,height,filename,maker_id,model_id,lens_id,camera_id,"
+      "exposure,aperture,iso,focal_length,focus_distance,datetime_taken,flags,0,0,crop,"
+      "raw_parameters,raw_black,raw_maximum,orientation,longitude,latitude,altitude,color_matrix,"
+      "colorspace,version,0,history_end,position,aspect_ratio,exposure_bias,whitebalance_id,"
+      "flash_id,exposure_program_id,metering_mode_id FROM main.images WHERE id=?1";
+  gboolean ok = _stage_sql(clone, source, 0, err);
+  if(ok)
+  {
+    const sqlite3_int64 id = sqlite3_last_insert_rowid(db);
+    ok = sqlite3_changes(db) == 1 && id > 0 && id <= INT_MAX;
+    if(ok) stage->imgid = (dt_imgid_t)id;
+    else _seterr(err, "could not create isolated request image");
+  }
+  if(ok)
+  {
+    char *flags = g_strdup_printf("UPDATE main.images SET group_id=id,flags=(flags|%d)&~%d,"
+      "aspect_ratio=0,thumb_timestamp=-1,thumb_maxmip=0 WHERE id=?1",
+      DT_IMAGE_AUTO_PRESETS_APPLIED | DT_IMAGE_NO_LEGACY_PRESETS,
+      DT_IMAGE_LOCAL_COPY | DT_IMAGE_REMOVE);
+    ok = _stage_sql(flags, stage->imgid, 0, err);
+    g_free(flags);
+  }
+  if(ok && !baseline) ok = _stage_copy_history(stage->imgid, source, err);
+  if(ok && baseline)
+    ok = _stage_sql("UPDATE main.images SET history_end=0,version=0 WHERE id=?1",
+                    stage->imgid, 0, err)
+      && _stage_sql("INSERT INTO main.module_order (imgid,version,iop_list) VALUES (?1,?2,NULL)",
+                     stage->imgid, DT_DEFAULT_IOP_ORDER_RAW, err);
+  if(!ok) sqlite3_exec(db, "ROLLBACK TO mcp_stage", NULL, NULL, NULL);
+  if(sqlite3_exec(db, "RELEASE mcp_stage", NULL, NULL, NULL) != SQLITE_OK) ok = FALSE;
+  if(!ok)
+  {
+    stage->imgid = NO_IMGID;
+    _stage_discard(stage);
+  }
+  return ok;
+}
+
+static gboolean _stage_commit(dt_mcp_stage_t *stage, const char *temporary,
+                               const char *target, char **err)
+{
+  if(!stage->commit)
+  {
+    if(!temporary || !g_rename(temporary, target)) return TRUE;
+    _seterr(err, "could not publish export output '%s'", target);
+    return FALSE;
+  }
+  sqlite3 *db = dt_database_get(darktable.db);
+  if(sqlite3_exec(db, "SAVEPOINT mcp_commit", NULL, NULL, NULL) != SQLITE_OK)
+  {
+    _seterr(err, "could not start history commit");
+    return FALSE;
+  }
+  gboolean ok = _stage_copy_history(stage->source, stage->imgid, err);
+  if(ok)
+  {
+    char *update = g_strdup_printf("UPDATE main.images SET history_end="
+      "(SELECT history_end FROM main.images WHERE id=?2),flags=flags|%d,"
+      "output_width=0,output_height=0,aspect_ratio=0,thumb_timestamp=-1,thumb_maxmip=0 WHERE id=?1",
+      DT_IMAGE_AUTO_PRESETS_APPLIED | DT_IMAGE_NO_LEGACY_PRESETS);
+    ok = _stage_sql(update, stage->source, stage->imgid, err);
+    g_free(update);
+  }
+  if(ok && temporary && g_rename(temporary, target))
+  {
+    _seterr(err, "could not publish export output '%s'", target);
+    ok = FALSE;
+  }
+  if(!ok) sqlite3_exec(db, "ROLLBACK TO mcp_commit", NULL, NULL, NULL);
+  if(sqlite3_exec(db, "RELEASE mcp_commit", NULL, NULL, NULL) != SQLITE_OK) ok = FALSE;
+  if(ok)
+  {
+    dt_image_cache_remove(stage->source);
+    dt_mipmap_cache_remove(stage->source);
+  }
+  return ok;
+}
+char *dt_bridge_image_parameters_json(const char *path, int imgid_in, char **err)
+{
+  dt_mcp_scratch_t sc = { FALSE, NO_FILMID, NULL, { NULL, FALSE } };
+  const dt_imgid_t source = _resolve_input(path, imgid_in, &sc, err);
+  if(!dt_is_valid_imgid(source)) return NULL;
+  dt_mcp_stage_t stage;
+  if(!_stage_begin(source, sc.active, NULL, FALSE, &stage, err))
+  {
+    if(sc.active) _drop_scratch(&sc);
+    return NULL;
+  }
+  dt_develop_t dev;
+  dt_dev_init(&dev, FALSE);
+  dt_dev_load_image(&dev, stage.imgid);
+  dt_dev_pop_history_items_ext(&dev, dev.history_end);
+
+  JsonBuilder *b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "imgid");
+  json_builder_add_int_value(b, source);
+  json_builder_set_member_name(b, "modules");
+  json_builder_begin_array(b);
+  for(GList *it = dev.iop; it; it = g_list_next(it))
+  {
+    dt_iop_module_t *mod = it->data;
+    if(!mod || !mod->so || !mod->so->get_introspection
+       || !mod->so->have_introspection) continue;
+    dt_introspection_t *intro = mod->so->get_introspection();
+    json_builder_begin_object(b);
+    json_builder_set_member_name(b, "operation");
+    json_builder_add_string_value(b, mod->so->op);
+    json_builder_set_member_name(b, "params_version");
+    json_builder_add_int_value(b, intro->params_version);
+    json_builder_set_member_name(b, "multi_priority");
+    json_builder_add_int_value(b, mod->multi_priority);
+    json_builder_set_member_name(b, "enabled");
+    json_builder_add_boolean_value(b, mod->enabled);
+    json_builder_set_member_name(b, "iop_order");
+    json_builder_add_int_value(b, mod->iop_order);
+    if(*mod->multi_name)
+    {
+      json_builder_set_member_name(b, "multi_name");
+      json_builder_add_string_value(b, mod->multi_name);
+    }
+    json_builder_set_member_name(b, "values");
+    dt_mcp_params_values(b, intro->field, mod->params);
+    json_builder_set_member_name(b, "defaults");
+    dt_mcp_params_values(b, intro->field, mod->default_params);
+    json_builder_end_object(b);
+  }
+  json_builder_end_array(b);
+  json_builder_end_object(b);
+  dt_dev_cleanup(&dev);
+  _stage_discard(&stage);
+  if(sc.active) _drop_scratch(&sc);
+  char *out = _builder_to_string(b);
+  g_object_unref(b);
+  return out;
+}
+
+static gboolean _validate_stack(JsonArray *stack, char **err)
+{
+  for(guint i = 0; stack && i < json_array_get_length(stack); i++)
+  {
+    JsonNode *node = json_array_get_element(stack, i);
+    if(!JSON_NODE_HOLDS_OBJECT(node))
+    {
+      _seterr(err, "stack[%u] must be an object", i);
+      return FALSE;
+    }
+    JsonObject *entry = json_node_get_object(node);
+    const char *known[] = { "operation", "params", "blob_hex", "params_version",
+                            "multi_priority", "enabled", "before", "after" };
+    GList *members = json_object_get_members(entry);
+    for(GList *it = members; it; it = it->next)
+    {
+      gboolean found = FALSE;
+      for(size_t j = 0; j < G_N_ELEMENTS(known); j++)
+        if(!strcmp(it->data, known[j])) { found = TRUE; break; }
+      if(!found)
+      {
+        _seterr(err, "stack[%u] unknown field '%s'", i, (const char *)it->data);
+        g_list_free(members);
+        return FALSE;
+      }
+    }
+    g_list_free(members);
+    JsonNode *op = json_object_get_member(entry, "operation");
+    if(!op || !JSON_NODE_HOLDS_STRING(op) || !*json_node_get_string(op))
+    {
+      _seterr(err, "stack[%u] requires a nonempty operation string", i);
+      return FALSE;
+    }
+    const char *strings[] = { "blob_hex", "before", "after" };
+    for(size_t j = 0; j < G_N_ELEMENTS(strings); j++)
+      if(json_object_has_member(entry, strings[j])
+         && !JSON_NODE_HOLDS_STRING(json_object_get_member(entry, strings[j])))
+      {
+        _seterr(err, "stack[%u].%s must be a string", i, strings[j]);
+        return FALSE;
+      }
+    const char *integers[] = { "params_version", "multi_priority" };
+    for(size_t j = 0; j < G_N_ELEMENTS(integers); j++)
+      if(json_object_has_member(entry, integers[j]))
+      {
+        JsonNode *value = json_object_get_member(entry, integers[j]);
+        if(!JSON_NODE_HOLDS_INT(value) || json_node_get_int(value) < 0
+           || json_node_get_int(value) > INT_MAX)
+        {
+          _seterr(err, "stack[%u].%s must be a nonnegative native integer", i, integers[j]);
+          return FALSE;
+        }
+      }
+    if(json_object_has_member(entry, "enabled")
+       && !JSON_NODE_HOLDS_BOOLEAN(json_object_get_member(entry, "enabled")))
+    {
+      _seterr(err, "stack[%u].enabled must be boolean", i);
+      return FALSE;
+    }
+    if(json_object_has_member(entry, "params")
+       && !JSON_NODE_HOLDS_OBJECT(json_object_get_member(entry, "params")))
+    {
+      _seterr(err, "stack[%u].params must be an object", i);
+      return FALSE;
+    }
+    if((json_object_has_member(entry, "params") && json_object_has_member(entry, "blob_hex"))
+       || (json_object_has_member(entry, "before") && json_object_has_member(entry, "after"))
+       || (json_object_has_member(entry, "blob_hex")
+           && !json_object_has_member(entry, "params_version")))
+    {
+      _seterr(err, "stack[%u] has conflicting fields or an unversioned blob", i);
+      return FALSE;
+    }
+  }
+  return TRUE;
 }
 
 // apply one stack entry to a module instance in dev and snapshot it to history
 static gboolean _apply_entry(dt_develop_t *dev, JsonObject *entry, char **err)
 {
-  const char *op = json_object_has_member(entry, "operation")
-                     ? json_object_get_string_member(entry, "operation") : NULL;
-  if(!op) { _seterr(err, "stack entry missing 'operation'"); return FALSE; }
+  JsonNode *op_node = json_object_get_member(entry, "operation");
+  if(!op_node || !JSON_NODE_HOLDS_VALUE(op_node)
+     || json_node_get_value_type(op_node) != G_TYPE_STRING)
+  {
+    _seterr(err, "stack entry requires string 'operation'");
+    return FALSE;
+  }
+  const char *op = json_node_get_string(op_node);
+  const gboolean has_params = json_object_has_member(entry, "params");
+  const gboolean has_blob = json_object_has_member(entry, "blob_hex");
+  if(has_params && has_blob)
+  {
+    _seterr(err, "stack entry '%s' cannot contain both 'params' and 'blob_hex'", op);
+    return FALSE;
+  }
+  if(has_params && !JSON_NODE_HOLDS_OBJECT(json_object_get_member(entry, "params")))
+  {
+    _seterr(err, "stack entry '%s' params must be an object", op);
+    return FALSE;
+  }
+  if(has_blob)
+  {
+    JsonNode *blob_node = json_object_get_member(entry, "blob_hex");
+    if(!JSON_NODE_HOLDS_VALUE(blob_node)
+       || json_node_get_value_type(blob_node) != G_TYPE_STRING)
+    {
+      _seterr(err, "stack entry '%s' blob_hex must be a string", op);
+      return FALSE;
+    }
+  }
+  if(json_object_has_member(entry, "multi_priority")
+     && !JSON_NODE_HOLDS_INT(json_object_get_member(entry, "multi_priority")))
+  {
+    _seterr(err, "stack entry '%s' multi_priority must be an integer", op);
+    return FALSE;
+  }
   const int multi_priority = json_object_has_member(entry, "multi_priority")
                      ? (int)json_object_get_int_member(entry, "multi_priority") : 0;
   const gboolean enabled = json_object_has_member(entry, "enabled")
                      ? json_object_get_boolean_member(entry, "enabled") : TRUE;
 
   dt_iop_module_t *mod = dt_iop_get_module_by_op_priority(dev->iop, op, multi_priority);
+  if(!mod && multi_priority > 0)
+  {
+    dt_iop_module_t *base = dt_iop_get_module_by_op_priority(dev->iop, op, -1);
+    if(base && !(base->flags() & IOP_FLAGS_ONE_INSTANCE))
+    {
+      mod = calloc(1, sizeof(*mod));
+      if(dt_iop_load_module(mod, base->so, dev)) mod = NULL;
+      else
+      {
+        mod->instance = base->instance;
+        dt_iop_update_multi_priority(mod, multi_priority);
+        dt_ioppr_insert_module_instance(dev, mod);
+        dev->iop = g_list_append(dev->iop, mod);
+        dt_ioppr_resync_modules_order(dev);
+        // reload_defaults can depend on whether this is the first ordered instance
+        dt_iop_reload_defaults(mod);
+      }
+    }
+  }
   if(!mod)
   {
-    _seterr(err, "module '%s' (priority %d) not found in pipe", op, multi_priority);
+    _seterr(err, "module '%s' instance %d is unavailable or cannot be created",
+            op, multi_priority);
+    return FALSE;
+  }
+  if(json_object_has_member(entry, "params_version")
+     && (!mod->so->get_introspection || json_object_get_int_member(entry, "params_version")
+         != mod->so->get_introspection()->params_version))
+  {
+    _seterr(err, "module '%s' parameter version is not current", op);
     return FALSE;
   }
 
@@ -1080,6 +1038,16 @@ static gboolean _apply_entry(dt_develop_t *dev, JsonObject *entry, char **err)
   uint8_t *blob = NULL;
   if(json_object_has_member(entry, "blob_hex"))
   {
+    dt_introspection_t *intro = mod->so->get_introspection
+      ? mod->so->get_introspection() : NULL;
+    const int version = json_object_has_member(entry, "params_version")
+      ? (int)json_object_get_int_member(entry, "params_version") : 0;
+    if(!intro || version != intro->params_version)
+    {
+      _seterr(err, "module '%s' requires params_version %d for blob_hex, got %d",
+              op, intro ? intro->params_version : -1, version);
+      return FALSE;
+    }
     blob = _hex_to_bytes(json_object_get_string_member(entry, "blob_hex"), &size);
     if(!blob) { _seterr(err, "invalid blob_hex for '%s'", op); return FALSE; }
   }
@@ -1228,114 +1196,90 @@ static cairo_surface_t *_render_to_surface(dt_imgid_t imgid, int w, int h,
   return surf;
 }
 
-// commit the requested edits to the image's history. the stack goes to the
-// image itself, not a throwaway copy, so it persists
-static gboolean _commit_stack(dt_imgid_t work, JsonArray *stack,
-                              gboolean disable_tone_mappers, int *history_end,
-                              gboolean scratch, char **err)
+// Prepare only the isolated request row. Publication decides whether it commits.
+static gboolean _prepare_stage(dt_mcp_stage_t *stage, const char *baseline,
+                               JsonArray *stack, gboolean disable_tone_mappers,
+                               int *history_end, char **err)
 {
-  const guint n_stack = stack ? json_array_get_length(stack) : 0;
-  const gboolean has_edits = disable_tone_mappers || n_stack > 0;
-
-  if(has_edits)
+  dt_develop_t dev;
+  dt_dev_init(&dev, FALSE);
+  dt_dev_load_image(&dev, stage->imgid);
+  if(baseline && !dt_image_is_rawprepare_supported(&dev.image_storage))
   {
-    // a scratch row is removed again before the request returns, so editing it
-    // changes nothing the caller could keep and needs no read-only refusal
-    if(_read_only && !scratch)
+    _seterr(err, "raw-development requires a supported RAW input");
+    dt_dev_cleanup(&dev);
+    return FALSE;
+  }
+  dt_dev_pop_history_items_ext(&dev, *history_end == -1 ? dev.history_end
+                                : MIN(*history_end, (int)g_list_length(dev.history)));
+  if(baseline)
+  {
+    const char *allowed[] = { "rawprepare", "temperature", "highlights", "demosaic",
+                              "flip", "exposure", "colorin", "colorout", "gamma" };
+    for(GList *it = dev.iop; it; it = it->next)
     {
-      _seterr(err, "server is --read-only: applying a stack would modify image %d",
-              work);
+      dt_iop_module_t *module = it->data;
+      gboolean keep = FALSE;
+      for(size_t j = 0; j < G_N_ELEMENTS(allowed); j++)
+        if(dt_iop_module_is(module, allowed[j])) { keep = TRUE; break; }
+      if(!keep && module->enabled)
+      {
+        module->enabled = FALSE;
+        dt_dev_add_history_item_ext(&dev, module, FALSE, TRUE);
+      }
+    }
+  }
+  if(disable_tone_mappers)
+  {
+    const char *names[] = { "sigmoid", "filmicrgb", "agx", "spektrafilm", "basecurve" };
+    for(size_t j = 0; j < G_N_ELEMENTS(names); j++)
+    {
+      dt_iop_module_t *module = dt_iop_get_module_by_op_priority(dev.iop, names[j], 0);
+      if(module && module->enabled)
+      {
+        module->enabled = FALSE;
+        dt_dev_add_history_item_ext(&dev, module, FALSE, TRUE);
+      }
+    }
+  }
+  for(guint i = 0; stack && i < json_array_get_length(stack); i++)
+    if(!_apply_entry(&dev, json_array_get_object_element(stack, i), err))
+    {
+      dt_dev_cleanup(&dev);
       return FALSE;
     }
-
-    dt_develop_t dev;
-    dt_dev_init(&dev, FALSE);
-    dt_dev_load_image(&dev, work);
-
-    // dt_dev_load_image() reads the history but does not replay it into module
-    // params (the darkroom does that at develop.c:1702), so without this a
-    // stack layers onto stale values. truncating here also keeps the stack
-    if(*history_end != -1)
-    {
-      // a value past the end would be written to images.history_end and the
-      // sidecar as-is, and read back unclamped
-      const int n_items = (int)g_list_length(dev.history);
-      dt_dev_pop_history_items_ext(&dev, MIN(*history_end, n_items));
-      *history_end = -1;
-    }
-    else
-      dt_dev_pop_history_items_ext(&dev, dev.history_end);
-
-    if(disable_tone_mappers)
-    {
-      // the display transforms plugins/darkroom/workflow chooses between
-      // (modulegroups.c:1938), plus basecurve for the display-referred one
-      const char *tms[] = { "sigmoid", "filmicrgb", "agx", "spektrafilm",
-                            "basecurve", NULL };
-      for(int i = 0; tms[i]; i++)
-      {
-        dt_iop_module_t *m = dt_iop_get_module_by_op_priority(dev.iop, tms[i], 0);
-        if(m && m->enabled)
-        {
-          m->enabled = FALSE;
-          dt_dev_add_history_item_ext(&dev, m, FALSE, TRUE);
-        }
-      }
-    }
-
-    for(guint i = 0; i < n_stack; i++)
-    {
-      JsonNode *en = json_array_get_element(stack, i);
-      if(!JSON_NODE_HOLDS_OBJECT(en)
-         || !_apply_entry(&dev, json_node_get_object(en), err))
-      {
-        if(JSON_NODE_HOLDS_OBJECT(en) == FALSE)
-          _seterr(err, "stack[%u] is not an object", i);
-        dt_dev_cleanup(&dev);
-        return FALSE;
-      }
-    }
-
-    dt_dev_write_history_ext(&dev, work);
-    dt_dev_cleanup(&dev);
-
-    // direct rather than dt_image_synch_xmp(), whose queue is drained by a
-    // background job that a request-scoped server outlives
-    if(!scratch) dt_image_write_sidecar_file(work);
-  }
+  dt_dev_write_history_ext(&dev, stage->imgid);
+  dt_dev_cleanup(&dev);
+  *history_end = -1;
   return TRUE;
 }
 
 // import/resolve, develop, render, and undo a scratch import afterwards
 static cairo_surface_t *_render_surface(const char *path, int imgid_in, int width,
-                                        int height, JsonArray *stack,
+                                        int height, const char *baseline, JsonArray *stack,
                                         gboolean disable_tone_mappers, int history_end,
+                                        dt_mcp_stage_t *stage, dt_mcp_scratch_t *scratch,
                                         char **err)
 {
-  // -1 is the only "whole history" value; anything else negative would be
-  // stored verbatim by dt_dev_pop_history_items_ext() and then persisted
-  if(history_end < -1)
+  if(history_end < -1 || !_validate_stack(stack, err))
   {
-    _seterr(err, "history_end must be -1 (all) or >= 0");
+    if(history_end < -1) _seterr(err, "history_end must be -1 (all) or >= 0");
     return NULL;
   }
-
-  dt_mcp_scratch_t sc = { FALSE, NO_FILMID, NULL, { NULL, FALSE } };
-  const dt_imgid_t work = _resolve_input(path, imgid_in, &sc, err);
-  if(!dt_is_valid_imgid(work)) return NULL;
-
-  // a scratch row is dropped whole, so only an image the caller keeps needs
-  // holding. the two never mute the sidecar at the same time
-  dt_mcp_pristine_t pr;
-  _pristine_hold(sc.active ? NO_IMGID : work, &pr);
-
-  cairo_surface_t *surf = NULL;
-  if(_commit_stack(work, stack, disable_tone_mappers, &history_end, sc.active, err))
-    surf = _render_to_surface(work, width, height, history_end, err);
-
-  _pristine_release(&pr);
-  if(sc.active) _drop_scratch(&sc);
-  return surf;
+  const dt_imgid_t source = _resolve_input(path, imgid_in, scratch, err);
+  if(!dt_is_valid_imgid(source)) return NULL;
+  const gboolean edits = baseline || disable_tone_mappers
+                          || (stack && json_array_get_length(stack));
+  cairo_surface_t *surface = NULL;
+  if(_stage_begin(source, scratch->active, baseline, edits, stage, err)
+     && _prepare_stage(stage, baseline, stack, disable_tone_mappers, &history_end, err))
+    surface = _render_to_surface(stage->imgid, width, height, history_end, err);
+  if(!surface)
+  {
+    _stage_discard(stage);
+    if(scratch->active) _drop_scratch(scratch);
+  }
+  return surface;
 }
 
 static cairo_status_t _png_writer(void *closure, const unsigned char *data,
@@ -1346,42 +1290,53 @@ static cairo_status_t _png_writer(void *closure, const unsigned char *data,
 }
 
 gboolean dt_bridge_render_png(const char *path, int imgid_in, int width, int height,
-                              void *stack_jsonarray, gboolean disable_tone_mappers,
-                              int history_end, uint8_t **png_out, size_t *png_len,
-                              char **err)
+                              const char *baseline, void *stack_jsonarray,
+                              gboolean disable_tone_mappers, int history_end,
+                              uint8_t **png_out, size_t *png_len, char **err)
 {
-  cairo_surface_t *surf = _render_surface(path, imgid_in, width, height,
+  dt_mcp_stage_t stage;
+  dt_mcp_scratch_t scratch = { FALSE, NO_FILMID, NULL, { NULL, FALSE } };
+  cairo_surface_t *surf = _render_surface(path, imgid_in, width, height, baseline,
                                           (JsonArray *)stack_jsonarray,
-                                          disable_tone_mappers,
-                                          history_end, err);
+                                          disable_tone_mappers, history_end,
+                                          &stage, &scratch, err);
   gboolean ok = FALSE;
   if(surf)
   {
     GByteArray *buf = g_byte_array_new();
     if(cairo_surface_write_to_png_stream(surf, _png_writer, buf) == CAIRO_STATUS_SUCCESS)
     {
-      *png_len = buf->len;
-      *png_out = g_byte_array_free(buf, FALSE); // hand raw bytes to caller
-      ok = TRUE;
+      if(_stage_commit(&stage, NULL, NULL, err))
+      {
+        *png_len = buf->len;
+        *png_out = g_byte_array_free(buf, FALSE);
+        ok = TRUE;
+      }
+      else g_byte_array_free(buf, TRUE);
     }
     else { g_byte_array_free(buf, TRUE); _seterr(err, "PNG encoding failed"); }
     cairo_surface_destroy(surf);
+    _stage_discard(&stage);
+    if(scratch.active) _drop_scratch(&scratch);
   }
   return ok;
 }
 
 char *dt_bridge_image_stats_json(const char *path, int imgid_in, int width, int height,
-                                 void *stack_jsonarray, gboolean disable_tone_mappers,
-                                 int history_end, char **err)
+                                 const char *baseline, void *stack_jsonarray,
+                                 gboolean disable_tone_mappers, int history_end, char **err)
 {
   // stats only need a small render, but substituting the default per dimension
   // would cap whichever one the caller did ask for
   const gboolean unsized = width <= 0 && height <= 0;
+  dt_mcp_stage_t stage;
+  dt_mcp_scratch_t scratch = { FALSE, NO_FILMID, NULL, { NULL, FALSE } };
   cairo_surface_t *surf = _render_surface(path, imgid_in,
                                           unsized ? 512 : width,
-                                          unsized ? 512 : height,
+                                          unsized ? 512 : height, baseline,
                                           (JsonArray *)stack_jsonarray,
-                                          disable_tone_mappers, history_end, err);
+                                          disable_tone_mappers, history_end,
+                                          &stage, &scratch, err);
   if(!surf) return NULL;
 
   cairo_surface_flush(surf);
@@ -1463,6 +1418,9 @@ char *dt_bridge_image_stats_json(const char *path, int imgid_in, int width, int 
   char *out = _builder_to_string(jb);
   g_object_unref(jb);
   cairo_surface_destroy(surf);
+  if(!_stage_commit(&stage, NULL, NULL, err)) { g_free(out); out = NULL; }
+  _stage_discard(&stage);
+  if(scratch.active) _drop_scratch(&scratch);
   return out;
 }
 
@@ -2460,6 +2418,25 @@ static gchar *_export_target(dt_imgid_t imgid, int seq, const char *out_path,
 }
 
 
+// output must never replace the source or an external metadata file
+static gboolean _export_target_safe(dt_imgid_t imgid, const char *target, char **err)
+{
+  char source[PATH_MAX] = { 0 };
+  dt_image_full_path(imgid, source, sizeof(source), NULL);
+  gchar *input = _canonical_path(source);
+  gchar *output = _canonical_path(target);
+  const char *extension = output ? strrchr(output, '.') : NULL;
+  GStatBuf in_stat, out_stat;
+  const gboolean aliases = g_stat(source, &in_stat) == 0 && g_stat(target, &out_stat) == 0
+    && in_stat.st_dev == out_stat.st_dev && in_stat.st_ino == out_stat.st_ino;
+  const gboolean safe = input && output && strcmp(input, output) && !aliases
+    && !dt_is_valid_imgid(dt_image_get_id_full_path(output))
+    && !(extension && !g_ascii_strcasecmp(extension, ".xmp"));
+  g_free(input);
+  g_free(output);
+  if(!safe) _seterr(err, "export_images: output must not replace an original or XMP sidecar");
+  return safe;
+}
 
 // create the directory an export is about to be written into
 static gboolean _ensure_parent_dir(const char *file, char **err)
@@ -2476,7 +2453,9 @@ static gboolean _ensure_parent_dir(const char *file, char **err)
 static gboolean _write_export(dt_imgid_t imgid, const char *filename,
                               dt_imageio_module_format_t *fmt, int quality,
                               int width, int height, int history_end,
-                              gboolean upscale, gboolean high_quality, char **err)
+                              gboolean upscale, gboolean high_quality,
+                              int requested_bpp, const char *icc_file,
+                              gboolean scene_linear, char **err)
 {
   // format settings live in the module's own conf keys; quality is the one a
   // caller reasonably varies per request, so set it around get_params
@@ -2497,8 +2476,18 @@ static gboolean _write_export(dt_imgid_t imgid, const char *filename,
       qkey = NULL;
     }
   }
-
+  int tiff_bpp_saved = 0;
+  gboolean set_tiff_bpp = !g_strcmp0(fmt->plugin_name, "tiff")
+                          && (scene_linear || requested_bpp > 0)
+                          && dt_conf_key_exists("plugins/imageio/format/tiff/bpp");
+  if(set_tiff_bpp)
+  {
+    tiff_bpp_saved = dt_conf_get_int("plugins/imageio/format/tiff/bpp");
+    dt_conf_set_int("plugins/imageio/format/tiff/bpp",
+                    scene_linear ? 32 : requested_bpp);
+  }
   dt_imageio_module_data_t *fdata = fmt->get_params(fmt);
+  if(set_tiff_bpp) dt_conf_set_int("plugins/imageio/format/tiff/bpp", tiff_bpp_saved);
   if(qkey) { dt_conf_set_int(qkey, qsaved); g_free(qkey); }
   if(!fdata)
   {
@@ -2520,9 +2509,12 @@ static gboolean _write_export(dt_imgid_t imgid, const char *filename,
 
   // the same output profile settings darktable's own export reads
   // (libs/export.c:417); -1 on either means the image's own choice stands
-  const dt_colorspaces_color_profile_type_t icc_type =
-    dt_conf_get_int("plugins/lighttable/export/icctype");
-  gchar *icc_filename = dt_conf_get_string("plugins/lighttable/export/iccprofile");
+  const dt_colorspaces_color_profile_type_t icc_type = icc_file
+    ? DT_COLORSPACE_FILE
+    : (scene_linear ? DT_COLORSPACE_LIN_REC2020
+                    : dt_conf_get_int("plugins/lighttable/export/icctype"));
+  gchar *icc_filename = icc_file ? g_strdup(icc_file)
+                                 : dt_conf_get_string("plugins/lighttable/export/iccprofile");
   const dt_iop_color_intent_t icc_intent =
     dt_conf_get_int("plugins/lighttable/export/iccintent");
 
@@ -2559,10 +2551,10 @@ static dt_imageio_module_format_t *_pick_format(const char *format_name,
     want = (conf && *conf) ? conf : "jpeg";
   }
 
-  // darktable knows jpeg by that name, not by the common abbreviation
+  // scene-linear-tiff is a bridge contract, not a format plugin name
+  if(!g_strcmp0(want, "scene-linear-tiff")) want = "tiff";
   if(!g_strcmp0(want, "jpg")) want = "jpeg";
   if(!g_strcmp0(want, "tif")) want = "tiff";
-
   dt_imageio_module_format_t *fmt = dt_imageio_get_format_by_name(want);
   if(!fmt) _seterr(err, "export_images: unknown format '%s'", want);
   g_free(guess);
@@ -2574,6 +2566,8 @@ gboolean dt_bridge_export_images(const char *in_path, int imgid_in,
                                  int history_end, const char *out_path,
                                  void *imgids_jsonarray, const char *out_dir,
                                  const char *format_name, int quality,
+                                 int bpp, const char *icc_file,
+                                 const char *baseline, void *stack_jsonarray,
                                  gboolean upscale, gboolean high_quality,
                                  void *written_paths, void *skipped_paths,
                                  char **err)
@@ -2582,6 +2576,8 @@ gboolean dt_bridge_export_images(const char *in_path, int imgid_in,
   GPtrArray *skipped_out = (GPtrArray *)skipped_paths;
   JsonArray *ids = (JsonArray *)imgids_jsonarray;
   const gboolean batch = ids && json_array_get_length(ids) > 0;
+  JsonArray *stack = (JsonArray *)stack_jsonarray;
+  if(!_validate_stack(stack, err)) return FALSE;
 
   if(history_end < -1)
   {
@@ -2603,6 +2599,17 @@ gboolean dt_bridge_export_images(const char *in_path, int imgid_in,
   if(!batch && !in_path && imgid_in <= 0)
   {
     _seterr(err, "export_images: need input.path/imgid, or 'imgids'");
+    return FALSE;
+  }
+  if(format_name && !g_strcmp0(format_name, "scene-linear-tiff") && !icc_file)
+  {
+    _seterr(err, "scene-linear-tiff requires an icc_file");
+    return FALSE;
+  }
+  if(icc_file && !dt_colorspaces_get_profile(DT_COLORSPACE_FILE, icc_file,
+                                             DT_PROFILE_DIRECTION_OUT))
+  {
+    _seterr(err, "export_images: icc_file must name a registered output profile in configdir/color/out");
     return FALSE;
   }
 
@@ -2651,16 +2658,36 @@ gboolean dt_bridge_export_images(const char *in_path, int imgid_in,
       else g_free(skipped);
       continue;
     }
-    if(!target) { all_ok = FALSE; untried = g_list_next(i); break; }
+    if(!target || !_export_target_safe(id, target, err))
+    {
+      all_ok = FALSE;
+      untried = g_list_next(i);
+      g_free(target);
+      break;
+    }
     g_hash_table_add(claimed, g_strdup(target));
 
-    // as in _render_surface(): --read-only must not develop an image on its way
-    // out to a JPEG
-    dt_mcp_pristine_t pr;
-    _pristine_hold(sc.active ? NO_IMGID : id, &pr);
-    all_ok = _write_export(id, target, fmt, quality, width, height, history_end,
-                           upscale, high_quality, err);
-    _pristine_release(&pr);
+    dt_mcp_stage_t stage;
+    int prepared_history_end = history_end;
+    const gboolean edits = baseline || (stack && json_array_get_length(stack));
+    all_ok = _stage_begin(id, sc.active, baseline, edits, &stage, err);
+    gchar *temporary = NULL;
+    if(all_ok) all_ok = _prepare_stage(&stage, baseline, stack, FALSE,
+                                      &prepared_history_end, err);
+    if(all_ok && _ensure_parent_dir(target, err))
+    {
+      temporary = g_strconcat(target, ".mcp-XXXXXX", NULL);
+      const int fd = g_mkstemp(temporary);
+      if(fd < 0) { _seterr(err, "could not create private export output"); all_ok = FALSE; }
+      else close(fd);
+    }
+    else all_ok = FALSE;
+    if(all_ok) all_ok = _write_export(stage.imgid, temporary, fmt, quality, width, height,
+                                      prepared_history_end, upscale, high_quality, bpp,
+                                      icc_file, !g_strcmp0(format_name, "scene-linear-tiff"), err);
+    if(all_ok) all_ok = _stage_commit(&stage, temporary, target, err);
+    if(temporary) { g_unlink(temporary); g_free(temporary); }
+    _stage_discard(&stage);
     if(!all_ok) { untried = g_list_next(i); g_free(target); break; }
     if(written) g_ptr_array_add(written, g_strdup(target));
     g_free(target);

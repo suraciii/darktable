@@ -7,7 +7,8 @@ add_executable(darktable-mcp
   main.c
   mcp_jsonrpc.c
   mcp_tools.c
-  dt_bridge.c)
+  dt_bridge.c
+  mcp_params.c)
 
 set_target_properties(darktable-mcp PROPERTIES LINKER_LANGUAGE C)
 

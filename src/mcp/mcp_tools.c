@@ -18,10 +18,14 @@
 
 #include "mcp/mcp_tools.h"
 #include "mcp/dt_bridge.h"
+#include "mcp/mcp_params.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 
+
+static JsonNode *_json_text_or_err(char *json, char *err);
 // ---------------------------------------------------------------------------
 // result builders
 // ---------------------------------------------------------------------------
@@ -102,10 +106,11 @@ static void _parse_image_input(JsonObject *args, const char **path, int *imgid)
   JsonNode *in = json_object_get_member(args, "input");
   if(!JSON_NODE_HOLDS_OBJECT(in)) return;
   JsonObject *io = json_node_get_object(in);
+  if(json_object_has_member(io, "path") == json_object_has_member(io, "imgid")) return;
   if(json_object_has_member(io, "path"))
-    *path = json_object_get_string_member(io, "path");
-  if(json_object_has_member(io, "imgid"))
-    *imgid = (int)json_object_get_int_member(io, "imgid");
+    *path = _arg_string(io, "path");
+  else
+    *imgid = _arg_int(io, "imgid", 0);
 }
 
 // shared parsing of the render/image_stats input arguments
@@ -123,7 +128,8 @@ static gboolean _parse_render_inputs(JsonObject *args, const char **path,
   if(json_object_has_member(args, "stack"))
   {
     JsonNode *s = json_object_get_member(args, "stack");
-    if(JSON_NODE_HOLDS_ARRAY(s)) *stack = json_node_get_array(s);
+    if(!JSON_NODE_HOLDS_ARRAY(s)) return FALSE;
+    *stack = json_node_get_array(s);
   }
   return (*path != NULL) || (*imgid > 0);
 }
@@ -162,10 +168,12 @@ static JsonNode *_tool_decode_params(JsonObject *args)
 {
   const char *op = _arg_string(args, "operation");
   const char *hex = _arg_string(args, "blob_hex");
-  if(!op || !hex)
-    return _text_result("missing required arguments 'operation' and 'blob_hex'", TRUE);
+  const int version = _arg_int(args, "params_version", 0);
+  if(!op || !hex || version <= 0)
+    return _text_result("missing required arguments 'operation', 'blob_hex', and"
+                        " positive 'params_version'", TRUE);
   char *err = NULL;
-  char *json = dt_bridge_decode_params_json(op, hex, &err);
+  char *json = dt_bridge_decode_params_json(op, hex, version, &err);
   if(!json)
   {
     JsonNode *r = _text_result(err ? err : "error", TRUE);
@@ -175,6 +183,16 @@ static JsonNode *_tool_decode_params(JsonObject *args)
   JsonNode *r = _text_result(json, FALSE);
   g_free(json);
   return r;
+}
+
+static JsonNode *_tool_image_parameters(JsonObject *args)
+{
+  const char *path = NULL;
+  int imgid = 0;
+  _parse_image_input(args, &path, &imgid);
+  char *err = NULL;
+  char *json = dt_bridge_image_parameters_json(path, imgid, &err);
+  return _json_text_or_err(json, err);
 }
 
 static JsonNode *_tool_encode_params(JsonObject *args)
@@ -211,7 +229,8 @@ static JsonNode *_tool_render(JsonObject *args)
   uint8_t *png = NULL;
   size_t len = 0;
   char *err = NULL;
-  if(!dt_bridge_render_png(path, imgid, w, h, stack, dtm, he, &png, &len, &err))
+  if(!dt_bridge_render_png(path, imgid, w, h, _arg_string(args, "baseline"),
+                           stack, dtm, he, &png, &len, &err))
   {
     JsonNode *r = _text_result(err ? err : "render failed", TRUE);
     g_free(err);
@@ -229,7 +248,8 @@ static JsonNode *_tool_image_stats(JsonObject *args)
     return _text_result("image_stats: provide input.path or input.imgid", TRUE);
 
   char *err = NULL;
-  char *json = dt_bridge_image_stats_json(path, imgid, w, h, stack, dtm, he, &err);
+  char *json = dt_bridge_image_stats_json(path, imgid, w, h,
+                                         _arg_string(args, "baseline"), stack, dtm, he, &err);
   if(!json)
   {
     JsonNode *r = _text_result(err ? err : "image_stats failed", TRUE);
@@ -385,21 +405,12 @@ static JsonNode *_tool_import_style(JsonObject *args)
 
 static JsonNode *_tool_export_images(JsonObject *args)
 {
-  // deliberately not _parse_render_inputs: an export must not carry a stack or
-  // the tone-mapper switch, both of which are committed to the image's history
   const char *path = NULL;
   int imgid = 0;
   _parse_image_input(args, &path, &imgid);
   const int w = _arg_int(args, "width", 0);
   const int h = _arg_int(args, "height", 0);
   const int he = _arg_int(args, "history_end", -1);
-  // export never edits, so a client sending these should be told rather than
-  // have them quietly dropped
-  if(args && (json_object_has_member(args, "stack")
-              || json_object_has_member(args, "disable_tone_mappers")))
-    return _text_result("export_images: 'stack' and 'disable_tone_mappers' are"
-                        " edits and belong to render; export writes the image"
-                        " as it already is", TRUE);
 
   const char *out_path = _arg_string(args, "out_path");
   const char *out_dir = _arg_string(args, "out_dir");
@@ -414,6 +425,10 @@ static JsonNode *_tool_export_images(JsonObject *args)
   if(!dt_bridge_export_images(path, imgid, w, h, he, out_path,
                               ids, out_dir, _arg_string(args, "format"),
                               _arg_int(args, "quality", 0),
+                              _arg_int(args, "bpp", 0),
+                              _arg_string(args, "icc_file"),
+                              _arg_string(args, "baseline"),
+                              _arg_array(args, "stack"),
                               _arg_bool(args, "upscale", FALSE),
                               _arg_bool(args, "high_quality", FALSE),
                               written, skipped, &err))
@@ -510,6 +525,7 @@ static const mcp_handler_t _handlers[] = {
   { "list_modules",     _tool_list_modules },
   { "module_schema",    _tool_module_schema },
   { "decode_params",    _tool_decode_params },
+  { "image_parameters", _tool_image_parameters },
   { "encode_params",    _tool_encode_params },
   { "render",           _tool_render },
   { "image_stats",      _tool_image_stats },
@@ -599,6 +615,83 @@ JsonNode *mcp_tools_list_node(void)
   return node;
 }
 
+// Validate the advertised request tree before any handler can coerce or mutate it.
+static gboolean _validate_arguments(JsonNode *value, JsonObject *schema, char **err)
+{
+  const char *type = json_object_has_member(schema, "type")
+                     ? json_object_get_string_member(schema, "type") : NULL;
+  gboolean valid = !type;
+  if(!g_strcmp0(type, "object")) valid = JSON_NODE_HOLDS_OBJECT(value);
+  else if(!g_strcmp0(type, "array")) valid = JSON_NODE_HOLDS_ARRAY(value);
+  else if(!g_strcmp0(type, "string")) valid = JSON_NODE_HOLDS_STRING(value);
+  else if(!g_strcmp0(type, "boolean")) valid = JSON_NODE_HOLDS_BOOLEAN(value);
+  else if(!g_strcmp0(type, "integer"))
+    valid = JSON_NODE_HOLDS_INT(value) && json_node_get_int(value) >= INT_MIN
+                                      && json_node_get_int(value) <= INT_MAX;
+  else if(!g_strcmp0(type, "number"))
+    valid = JSON_NODE_HOLDS_INT(value) || JSON_NODE_HOLDS_DOUBLE(value);
+  if(!valid)
+  {
+    *err = g_strdup_printf("argument requires %s", type ? type : "a supported JSON type");
+    return FALSE;
+  }
+  if(json_object_has_member(schema, "enum"))
+  {
+    JsonArray *choices = json_object_get_array_member(schema, "enum");
+    gboolean member = FALSE;
+    for(guint i = 0; i < json_array_get_length(choices); i++)
+      if(json_node_equal(value, json_array_get_element(choices, i))) { member = TRUE; break; }
+    if(!member) { *err = g_strdup("argument is not an advertised enum choice"); return FALSE; }
+  }
+  if(JSON_NODE_HOLDS_INT(value))
+  {
+    const gint64 number = json_node_get_int(value);
+    if((json_object_has_member(schema, "minimum")
+        && number < json_object_get_int_member(schema, "minimum"))
+       || (json_object_has_member(schema, "maximum")
+           && number > json_object_get_int_member(schema, "maximum")))
+    {
+      *err = g_strdup("argument is outside its advertised range");
+      return FALSE;
+    }
+  }
+  if(JSON_NODE_HOLDS_OBJECT(value))
+  {
+    JsonObject *object = json_node_get_object(value);
+    JsonObject *properties = json_object_has_member(schema, "properties")
+                             ? json_object_get_object_member(schema, "properties") : NULL;
+    JsonArray *required = json_object_has_member(schema, "required")
+                          ? json_object_get_array_member(schema, "required") : NULL;
+    for(guint i = 0; required && i < json_array_get_length(required); i++)
+      if(!json_object_has_member(object, json_array_get_string_element(required, i)))
+      { *err = g_strdup("required argument is missing"); return FALSE; }
+    GList *members = json_object_get_members(object);
+    for(GList *it = members; it; it = it->next)
+    {
+      JsonObject *child = properties && json_object_has_member(properties, it->data)
+                          ? json_object_get_object_member(properties, it->data) : NULL;
+      if(!child && json_object_has_member(schema, "additionalProperties")
+         && !json_object_get_boolean_member(schema, "additionalProperties"))
+      {
+        *err = g_strdup_printf("unknown argument '%s'", (const char *)it->data);
+        g_list_free(members);
+        return FALSE;
+      }
+      if(child && !_validate_arguments(json_object_get_member(object, it->data), child, err))
+      { g_list_free(members); return FALSE; }
+    }
+    g_list_free(members);
+  }
+  if(JSON_NODE_HOLDS_ARRAY(value) && json_object_has_member(schema, "items"))
+  {
+    JsonArray *array = json_node_get_array(value);
+    JsonObject *item = json_object_get_object_member(schema, "items");
+    for(guint i = 0; i < json_array_get_length(array); i++)
+      if(!_validate_arguments(json_array_get_element(array, i), item, err)) return FALSE;
+  }
+  return TRUE;
+}
+
 JsonNode *mcp_tools_call_node(const char *name, JsonObject *arguments, gboolean *found)
 {
   for(size_t i = 0; i < _n_handlers; i++)
@@ -606,6 +699,28 @@ JsonNode *mcp_tools_call_node(const char *name, JsonObject *arguments, gboolean 
     if(!g_strcmp0(name, _handlers[i].name))
     {
       if(found) *found = TRUE;
+      if(_tools_meta)
+      {
+        JsonArray *metadata = json_node_get_array(_tools_meta);
+        for(guint j = 0; j < json_array_get_length(metadata); j++)
+        {
+          JsonObject *tool = json_array_get_object_element(metadata, j);
+          if(g_strcmp0(name, json_object_get_string_member(tool, "name"))) continue;
+          JsonNode *node = json_node_new(JSON_NODE_OBJECT);
+          json_node_set_object(node, arguments);
+          char *err = NULL;
+          const gboolean valid = _validate_arguments(node,
+            json_object_get_object_member(tool, "inputSchema"), &err);
+          json_node_free(node);
+          if(!valid)
+          {
+            JsonNode *result = _text_result(err, TRUE);
+            g_free(err);
+            return result;
+          }
+          break;
+        }
+      }
       return _handlers[i].fn(arguments);
     }
   }

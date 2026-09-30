@@ -164,10 +164,10 @@ Standard MCP handshake over stdio, both newline-delimited JSON (default) and
 | Tool | Input | Output |
 |------|-------|--------|
 | `list_modules` | – | `[{operation, version, have_introspection, doc_url}]` |
-| `module_schema` | `{operation}` | fields with `{name, type, offset, min, max, default}` (enum values listed) + `doc_url` |
-| `decode_params` | `{operation, blob_hex}` | `{operation, version, fields:{…}}` — named values from a hex `op_params` blob |
-| `encode_params` | `{operation, fields:{…}}` | `{operation, blob_hex}` — seeds defaults, applies fields (enums accept symbolic names) |
-
+| `module_schema` | `{operation}` | recursive schema including nested structs, arrays, string constraints, ranges, enum symbols/descriptions, and explicit unsupported kinds |
+| `decode_params` | `{operation, blob_hex, params_version}` | `{operation, version, fields:{…}}`; size and version must both match |
+| `encode_params` | `{operation, fields:{…}}` | `{operation, blob_hex}` — strict typed validation, no coercion |
+| `image_parameters` | `{input:{path\|imgid}}` | initialized module values, reset defaults, instance identities, and `iop_order` |
 `doc_url` is the module's page in the darktable usermanual — fetch it for prose
 docs on what each parameter means.
 
@@ -268,7 +268,7 @@ before it, with nothing recording that it happened. Restart with
 | `apply_style` | `{name, imgid \| imgids[], overwrite?}` | `{ok:true}` |
 | `save_style` | `{name, description?, imgid}` | `{ok:true}` |
 | `import_style` | `{path}` | `{ok:true}` (`.dtstyle` → styles DB) |
-| `export_images` | `{input \| imgids[], out_path?, out_dir?, format?, quality?, width?, height?, upscale?, high_quality?, …}` | `{ok, exported, paths[]}` — writes files, returns where they landed |
+| `export_images` | `{input \| imgids[], out_path?, out_dir?, format?, quality?, width?, height?, upscale?, high_quality?, …}` | `{ok, exported, paths[]}` — writes files; `format:"scene-linear-tiff"` forces full-size float32 scene-linear TIFF |
 
 **Importing.** `import_images` is how files enter the catalog: pass `paths`, or a
 `folder` (with `recursive` for subdirectories) to add a whole shoot. Re-importing
