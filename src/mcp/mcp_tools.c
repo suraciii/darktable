@@ -261,6 +261,24 @@ static JsonNode *_tool_image_stats(JsonObject *args)
   return r;
 }
 
+static JsonNode *_tool_auto_parameters(JsonObject *args)
+{
+  const char *path = NULL;
+  int imgid = 0;
+  _parse_image_input(args, &path, &imgid);
+  const char *operation = _arg_string(args, "operation");
+  JsonNode *instruction = args ? json_object_get_member(args, "instruction") : NULL;
+  if((!path && imgid <= 0) || !operation || !instruction
+     || !JSON_NODE_HOLDS_OBJECT(instruction))
+    return _text_result("auto_parameters: requires input, operation, and instruction", TRUE);
+  char *err = NULL;
+  char *json = dt_bridge_auto_parameters_json(
+    path, imgid, _arg_string(args, "baseline"), _arg_array(args, "stack"),
+    operation, _arg_int(args, "multi_priority", 0),
+    json_node_get_object(instruction), &err);
+  return _json_text_or_err(json, err);
+}
+
 static JsonNode *_json_text_or_err(char *json, char *err)
 {
   if(!json)
@@ -529,6 +547,7 @@ static const mcp_handler_t _handlers[] = {
   { "encode_params",    _tool_encode_params },
   { "render",           _tool_render },
   { "image_stats",      _tool_image_stats },
+  { "auto_parameters",  _tool_auto_parameters },
   { "list_images",      _tool_list_images },
   { "get_history",      _tool_get_history },
   { "list_styles",      _tool_list_styles },

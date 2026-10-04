@@ -57,6 +57,12 @@ char *dt_bridge_image_stats_json(const char *path, int imgid_in, int width, int 
                                  const char *baseline, void *stack_jsonarray,
                                  gboolean disable_tone_mappers, int history_end, char **err);
 
+/** Evaluate one module-owned automatic instruction and return concrete params. */
+char *dt_bridge_auto_parameters_json(const char *path, int imgid_in,
+                                     const char *baseline, void *stack_jsonarray,
+                                     const char *operation, int multi_priority,
+                                     void *instruction_jsonobject, char **err);
+
 // --- library (catalog) tools ---
 
 /** JSON array of { imgid, path } for images in the current library */

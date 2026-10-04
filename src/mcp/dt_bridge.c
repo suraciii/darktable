@@ -37,6 +37,9 @@
 #include "common/usermanual_url.h"
 #include "develop/develop.h"
 #include "develop/imageop.h"
+#include "develop/pixelpipe_hb.h"
+#include "iop/exposure.h"
+#include "iop/channelmixerrgb.h"
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
 
@@ -1206,10 +1209,13 @@ static cairo_surface_t *_render_to_surface(dt_imgid_t imgid, int w, int h,
   return surf;
 }
 
-// Prepare only the isolated request row. Publication decides whether it commits.
-static gboolean _prepare_stage(dt_mcp_stage_t *stage, const char *baseline,
-                               JsonArray *stack, gboolean disable_tone_mappers,
-                               int *history_end, char **err)
+
+typedef gboolean (*_stage_inspector_fn)(dt_develop_t *dev, gpointer context, char **err);
+
+static gboolean _prepare_stage_internal(dt_mcp_stage_t *stage, const char *baseline,
+                                         JsonArray *stack, gboolean disable_tone_mappers,
+                                         int *history_end, _stage_inspector_fn inspect,
+                                         gpointer context, char **err)
 {
   if(baseline && *history_end != -1)
   {
@@ -1231,12 +1237,25 @@ static gboolean _prepare_stage(dt_mcp_stage_t *stage, const char *baseline,
   {
     const char *allowed[] = { "rawprepare", "temperature", "highlights", "demosaic",
                               "flip", "exposure", "colorin", "colorout", "gamma" };
+    gboolean stack_requests_channelmixerrgb = FALSE;
+    for(guint i = 0; stack && i < json_array_get_length(stack); i++)
+    {
+      JsonObject *entry = json_array_get_object_element(stack, i);
+      if(entry && json_object_get_string_member_with_default(entry, "operation", "")
+                 && !strcmp(json_object_get_string_member_with_default(entry, "operation", ""),
+                            "channelmixerrgb"))
+      {
+        stack_requests_channelmixerrgb = TRUE;
+        break;
+      }
+    }
     for(GList *it = dev.iop; it; it = it->next)
     {
       dt_iop_module_t *module = it->data;
-      gboolean keep = FALSE;
-      for(size_t j = 0; j < G_N_ELEMENTS(allowed); j++)
-        if(dt_iop_module_is(module, allowed[j])) { keep = TRUE; break; }
+      gboolean keep = stack_requests_channelmixerrgb
+                      && dt_iop_module_is(module, "channelmixerrgb");
+      for(size_t j = 0; !keep && j < G_N_ELEMENTS(allowed); j++)
+        if(dt_iop_module_is(module, allowed[j])) keep = TRUE;
       if(!keep && module->enabled)
       {
         module->enabled = FALSE;
@@ -1264,9 +1283,177 @@ static gboolean _prepare_stage(dt_mcp_stage_t *stage, const char *baseline,
       return FALSE;
     }
   dt_dev_write_history_ext(&dev, stage->imgid);
+  const gboolean inspected = !inspect || inspect(&dev, context, err);
   dt_dev_cleanup(&dev);
+  if(!inspected) return FALSE;
   *history_end = -1;
   return TRUE;
+}
+
+// Prepare only the isolated request row. Publication decides whether it commits.
+static gboolean _prepare_stage(dt_mcp_stage_t *stage, const char *baseline,
+                               JsonArray *stack, gboolean disable_tone_mappers,
+                               int *history_end, char **err)
+{
+  return _prepare_stage_internal(stage, baseline, stack, disable_tone_mappers,
+                                 history_end, NULL, NULL, err);
+}
+
+
+typedef struct
+{
+  const char *operation;
+  int multi_priority;
+  JsonObject *instruction;
+  char *result;
+} _auto_context_t;
+
+static gboolean _auto_inspect(dt_develop_t *dev, gpointer user_data, char **err)
+{
+  _auto_context_t *context = user_data;
+  if(!strcmp(context->operation, "channelmixerrgb"))
+  {
+    const char *kind = context->instruction
+      ? json_object_get_string_member_with_default(context->instruction,
+          "illuminant", "DT_ILLUMINANT_DETECT_EDGES")
+      : "DT_ILLUMINANT_DETECT_EDGES";
+    const dt_illuminant_t requested =
+      !strcmp(kind, "DT_ILLUMINANT_DETECT_SURFACES")
+        ? DT_ILLUMINANT_DETECT_SURFACES : DT_ILLUMINANT_DETECT_EDGES;
+    float x = NAN, y = NAN, temperature = NAN;
+    dt_illuminant_t illuminant = DT_ILLUMINANT_CUSTOM;
+    dt_adaptation_t adaptation = DT_ADAPTATION_CAT16;
+    JsonObject *request = json_object_new();
+    json_object_set_string_member(request, "operation", context->operation);
+    json_object_set_int_member(request, "multi_priority", context->multi_priority);
+    json_object_set_object_member(request, "params",
+      context->instruction ? json_object_ref(context->instruction) : json_object_new());
+    const gboolean request_ok = _apply_entry(dev, request, err);
+    json_object_unref(request);
+    dt_iop_module_t *module =
+      dt_iop_get_module_by_op_priority(dev->iop, context->operation,
+                                       context->multi_priority);
+    if(!module || !request_ok
+       || !dt_iop_channelmixer_rgb_detect_dev(dev, module, requested,
+          &x, &y, &temperature, &illuminant, &adaptation))
+    {
+      if(!err || !*err) _seterr(err, "native channelmixerrgb detection failed");
+      return FALSE;
+    }
+    JsonObject *concrete = json_object_new();
+    json_object_set_string_member(concrete, "operation", context->operation);
+    json_object_set_int_member(concrete, "multi_priority", context->multi_priority);
+    JsonObject *params = json_object_new();
+    json_object_set_string_member(params, "illuminant", "DT_ILLUMINANT_CUSTOM");
+    json_object_set_double_member(params, "x", x);
+    json_object_set_double_member(params, "y", y);
+    json_object_set_double_member(params, "temperature", temperature);
+    json_object_set_string_member(params, "adaptation", "DT_ADAPTATION_CAT16");
+    json_object_set_object_member(concrete, "params", params);
+    if(!_apply_entry(dev, concrete, err)) { json_object_unref(concrete); return FALSE; }
+    json_object_unref(concrete);
+    JsonBuilder *builder = json_builder_new();
+    json_builder_begin_object(builder);
+    json_builder_set_member_name(builder, "operation");
+    json_builder_add_string_value(builder, context->operation);
+    json_builder_set_member_name(builder, "multi_priority");
+    json_builder_add_int_value(builder, context->multi_priority);
+    json_builder_set_member_name(builder, "params");
+    _write_fields_object(module->so, module->params, builder);
+    json_builder_end_object(builder);
+    context->result = _builder_to_string(builder);
+    g_object_unref(builder);
+    return context->result != NULL;
+  }
+  if(strcmp(context->operation, "exposure"))
+  {
+    _seterr(err, "automatic operation '%s' is not qualified", context->operation);
+    return FALSE;
+  }
+
+  JsonObject *fields = json_object_new();
+  if(context->instruction)
+  {
+    GList *members = json_object_get_members(context->instruction);
+    for(GList *it = members; it; it = it->next)
+    {
+      const char *name = it->data;
+      json_object_set_member(fields, g_strdup(name),
+                             json_node_copy(json_object_get_member(context->instruction, name)));
+    }
+    g_list_free(members);
+  }
+  json_object_set_string_member(fields, "mode", "EXPOSURE_MODE_DEFLICKER");
+
+  JsonObject *entry = json_object_new();
+  json_object_set_string_member(entry, "operation", context->operation);
+  json_object_set_int_member(entry, "multi_priority", context->multi_priority);
+  json_object_set_object_member(entry, "params", fields);
+  const gboolean applied = _apply_entry(dev, entry, err);
+  json_object_unref(entry);
+  dt_iop_module_t *module =
+    dt_iop_get_module_by_op_priority(dev->iop, context->operation,
+                                     context->multi_priority);
+  if(!applied || !module) return FALSE;
+
+  float exposure = 0.0f;
+  if(!dt_exposure_compute_deflicker(module, &exposure))
+  {
+    _seterr(err, "native exposure deflicker could not compute a result");
+    return FALSE;
+  }
+  dt_exposure_set_manual(module, exposure);
+
+  JsonBuilder *builder = json_builder_new();
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "operation");
+  json_builder_add_string_value(builder, context->operation);
+  json_builder_set_member_name(builder, "multi_priority");
+  json_builder_add_int_value(builder, context->multi_priority);
+  json_builder_set_member_name(builder, "params");
+  _write_fields_object(module->so, module->params, builder);
+  json_builder_end_object(builder);
+  context->result = _builder_to_string(builder);
+  g_object_unref(builder);
+  return context->result != NULL;
+}
+
+char *dt_bridge_auto_parameters_json(const char *path, int imgid_in,
+                                     const char *baseline, void *stack_jsonarray,
+                                     const char *operation, int multi_priority,
+                                     void *instruction_jsonobject, char **err)
+{
+  if(!operation || !*operation || multi_priority < 0)
+  {
+    _seterr(err, "automatic operation and nonnegative multi_priority are required");
+    return NULL;
+  }
+  JsonArray *stack = (JsonArray *)stack_jsonarray;
+  if(!_validate_stack(stack, err)) return NULL;
+  dt_mcp_scratch_t scratch = { FALSE, NO_FILMID, NULL, { NULL, FALSE } };
+  const dt_imgid_t source = _resolve_input(path, imgid_in, &scratch, err);
+  if(!dt_is_valid_imgid(source)) return NULL;
+  dt_mcp_stage_t stage;
+  if(!_stage_begin(source, scratch.active, baseline, FALSE, &stage, err))
+  {
+    if(scratch.active) _drop_scratch(&scratch);
+    return NULL;
+  }
+  _auto_context_t context = {
+    .operation = operation,
+    .multi_priority = multi_priority,
+    .instruction = (JsonObject *)instruction_jsonobject,
+    .result = NULL
+  };
+  int history_end = -1;
+  const gboolean ok = _prepare_stage_internal(&stage, baseline, stack, FALSE,
+                                               &history_end, _auto_inspect,
+                                               &context, err);
+  char *result = ok ? context.result : NULL;
+  if(!ok) g_free(context.result);
+  _stage_discard(&stage);
+  if(scratch.active) _drop_scratch(&scratch);
+  return result;
 }
 
 // import/resolve, develop, render, and undo a scratch import afterwards

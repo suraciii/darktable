@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Black-box MCP contract scenario against an explicitly selected binary."""
 import base64
+import math
 import copy
 import hashlib
 import json
@@ -114,8 +115,7 @@ class EngineContract(unittest.TestCase):
         self.config = root / "config"
         self.config.mkdir()
         self.source = root / "synthetic.tiff"
-        image = Image.new("RGB", (32, 24))
-        image.putdata([(x * 7, y * 9, (x + y) * 4) for y in range(24) for x in range(32)])
+        image = Image.new("RGB", (64, 48), (96, 128, 160))
         image.save(self.source, format="TIFF")
         self.source_before = fingerprint(self.source)
         self.binary = Path(os.environ.get("DARKTABLE_MCP_BINARY", sys.argv[1]))
@@ -139,6 +139,34 @@ class EngineContract(unittest.TestCase):
         result = self.client.tool("import_images", {"paths": [str(self.source)]})
         self.assertEqual(result["imported"], 1)
         return result["images"][0]["imgid"]
+
+    def test_channelmix_auto_parameters_are_concrete_and_discarded(self):
+        image_id = self.import_source()
+        before = self.snapshot()
+        arguments = {
+            "input": {"imgid": image_id},
+            "operation": "channelmixerrgb",
+            "multi_priority": 1,
+            "instruction": {"illuminant": "DT_ILLUMINANT_DETECT_EDGES"},
+            "stack": [],
+        }
+        result = self.client.tool("auto_parameters", arguments)
+        self.assertEqual(result["operation"], "channelmixerrgb")
+        self.assertEqual(result["multi_priority"], 1)
+        params = result["params"]
+        self.assertEqual(params["illuminant"], "DT_ILLUMINANT_CUSTOM")
+        self.assertEqual(params["adaptation"], "DT_ADAPTATION_CAT16")
+        for field in ("x", "y", "temperature"):
+            self.assertTrue(math.isfinite(float(params[field])))
+        self.assertEqual(before, self.snapshot())
+
+        self.client.close()
+        self.client = McpClient(self.binary, self.config, read_only=True)
+        readonly_result = self.client.tool("auto_parameters", arguments)
+        self.assertEqual(readonly_result["operation"], "channelmixerrgb")
+        self.assertEqual(readonly_result["multi_priority"], 1)
+        self.assertEqual(before, self.snapshot())
+
 
     def snapshot(self):
         tables = ("images", "history", "masks_history", "module_order", "history_hash",
@@ -321,7 +349,7 @@ class EngineContract(unittest.TestCase):
         self.export(image_id, output, stack)
         with tifffile.TiffFile(output) as tiff:
             samples = tiff.asarray()
-            self.assertEqual(samples.shape, (24, 32, 3))
+            self.assertEqual(samples.shape, (48, 64, 3))
             self.assertEqual(samples.dtype, "float32")
             self.assertEqual(hashlib.sha256(tiff.pages[0].tags[34675].value).hexdigest(),
                              "7bef28a81c974482756f09c7d34c55d53549ba450f26185b2c16f6228af96dfe")

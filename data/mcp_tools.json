@@ -286,6 +286,57 @@
     }
   },
   {
+    "name": "auto_parameters",
+    "description": "Run one qualified module-owned automatic adjustment in an isolated image context and return the concrete parameters computed by the native engine. The result is not persisted by darktable.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "input": {
+          "type": "object",
+          "properties": {
+            "path": { "type": "string" },
+            "imgid": { "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": false
+        },
+        "baseline": {
+          "type": "string",
+          "enum": ["raw-development"]
+        },
+        "stack": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "operation": { "type": "string" },
+              "params": { "type": "object" },
+              "blob_hex": { "type": "string" },
+              "params_version": { "type": "integer", "minimum": 1 },
+              "multi_priority": { "type": "integer", "minimum": 0 },
+              "enabled": { "type": "boolean" },
+              "before": { "type": "string" },
+              "after": { "type": "string" }
+            },
+            "required": ["operation"],
+            "additionalProperties": false
+          }
+        },
+        "operation": {
+          "type": "string",
+          "enum": ["exposure", "channelmixerrgb"]
+        },
+        "multi_priority": { "type": "integer", "minimum": 0 },
+        "instruction": {
+          "type": "object",
+          "description": "Exposure accepts deflicker_percentile (default 50) and deflicker_target_level (default -4). Channelmixerrgb accepts illuminant DETECT_EDGES or DETECT_SURFACES.",
+          "additionalProperties": true
+        }
+      },
+      "required": ["input", "operation", "instruction"],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "import_images",
     "description": "add files to the library so they can be edited, rated and exported by imgid. this is the way images should enter darktable: rendering by input.path instead imports the file only for that one request and then removes it again, keeping nothing. give 'paths', or a 'folder' to add a whole shoot",
     "inputSchema": {
