@@ -1824,7 +1824,8 @@ static dt_imgid_t _image_import_internal(const dt_filmid_t film_id,
                                          const char *filename,
                                          const gboolean override_ignore_nonraws,
                                          const gboolean lua_locking,
-                                         const gboolean raise_signals)
+                                         const gboolean raise_signals,
+                                         const gboolean load_sidecars)
 {
   char *normalized_filename = dt_util_normalize_path(filename);
   if(!normalized_filename || !dt_util_test_image_file(normalized_filename))
@@ -1885,7 +1886,7 @@ static dt_imgid_t _image_import_internal(const dt_filmid_t film_id,
     dt_image_cache_write_release(img, DT_IMAGE_CACHE_RELAXED);
     // Reconcile with XMP sidecars unless library history is preferred to avoid
     // overwriting library edit history with potentially stale XMP history.
-    if(!darktable.prefer_library_history)
+    if(load_sidecars && !darktable.prefer_library_history)
     {
       _image_read_duplicates(id, normalized_filename, raise_signals);
       dt_image_synch_all_xmp(normalized_filename);
@@ -2056,20 +2057,22 @@ static dt_imgid_t _image_import_internal(const dt_filmid_t film_id,
     // read dttags and exif for database queries!
     if(dt_exif_read(img, normalized_filename))
       img->exif_inited = FALSE;
-    char dtfilename[PATH_MAX] = { 0 };
-    g_strlcpy(dtfilename, normalized_filename, sizeof(dtfilename));
-    // dt_image_path_append_version(id, dtfilename, sizeof(dtfilename));
-    g_strlcat(dtfilename, ".xmp", sizeof(dtfilename));
-
-    res = dt_exif_xmp_read(img, dtfilename, FALSE);
+    if(load_sidecars)
+    {
+      char dtfilename[PATH_MAX] = { 0 };
+      g_strlcpy(dtfilename, normalized_filename, sizeof(dtfilename));
+      g_strlcat(dtfilename, ".xmp", sizeof(dtfilename));
+      res = dt_exif_xmp_read(img, dtfilename, FALSE);
+    }
   }
   // write through to db, but not to xmp.
   dt_image_cache_write_release(img, DT_IMAGE_CACHE_RELAXED);
 
   // read all sidecar files
-  const int nb_xmp = _image_read_duplicates(id, normalized_filename, raise_signals);
+  const int nb_xmp = load_sidecars
+    ? _image_read_duplicates(id, normalized_filename, raise_signals) : 0;
 
-  if(res && (nb_xmp == 0))
+  if(load_sidecars && res && (nb_xmp == 0))
   {
     // Search for Lightroom sidecar file, import tags if found
     const gboolean lr_xmp = dt_lightroom_import(id, NULL, TRUE);
@@ -2090,7 +2093,7 @@ static dt_imgid_t _image_import_internal(const dt_filmid_t film_id,
   dt_mipmap_cache_remove(id);
 
   // Always keep write timestamp in database and possibly write xmp
-  dt_image_synch_all_xmp(normalized_filename);
+  if(load_sidecars) dt_image_synch_all_xmp(normalized_filename);
 
   g_free(imgfname);
   g_free(basename);
@@ -2176,14 +2179,20 @@ dt_imgid_t dt_image_import(const dt_filmid_t film_id,
                            const gboolean raise_signals)
 {
   return _image_import_internal(film_id, filename, override_ignore_nonraws,
-                                TRUE, raise_signals);
+                                TRUE, raise_signals, TRUE);
+}
+
+dt_imgid_t dt_image_import_no_sidecars(const dt_filmid_t film_id,
+                                      const char *filename)
+{
+  return _image_import_internal(film_id, filename, TRUE, TRUE, FALSE, FALSE);
 }
 
 dt_imgid_t dt_image_import_lua(const dt_filmid_t film_id,
                                const char *filename,
                                const gboolean override_ignore_nonraws)
 {
-  return _image_import_internal(film_id, filename, override_ignore_nonraws, FALSE, TRUE);
+  return _image_import_internal(film_id, filename, override_ignore_nonraws, FALSE, TRUE, TRUE);
 }
 
 void dt_image_init(dt_image_t *img)

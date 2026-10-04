@@ -58,6 +58,9 @@
 #include "gui/gtk.h"
 #include "gui/presets.h"
 #include "iop/iop_api.h"
+#include "common/mipmap_cache.h"
+#include "develop/pixelpipe_hb.h"
+#include "iop/channelmixerrgb.h"
 #include "gaussian_elimination.h"
 
 #include <assert.h>
@@ -989,15 +992,6 @@ static inline void _loop_switch(const float *const restrict in,
 #define OFF 4
 
 
-#ifdef AI_ACTIVATED
-
-#if defined(__GNUC__) && defined(_WIN32)
-  // On Windows there is a rounding issue making the image full
-  // black. For a discussion about the issue and tested solutions see
-  // PR #12382).
-  #pragma GCC push_options
-  #pragma GCC optimize ("-fno-finite-math-only")
-#endif
 
 static inline void _auto_detect_WB(const float *const restrict in,
                                    float *const restrict temp,
@@ -1008,168 +1002,19 @@ static inline void _auto_detect_WB(const float *const restrict in,
                                    const dt_colormatrix_t RGB_to_XYZ,
                                    dt_aligned_pixel_t xyz)
 {
-   /* Detect the chromaticity of the illuminant based on the grey edges hypothesis.
-      So we compute a laplacian filter and get the weighted average of its chromaticities
-
-      Inspired by :
-      A Fast White Balance Algorithm Based on Pixel Greyness, Ba Thai·Guang Deng·Robert Ross
-      https://www.researchgate.net/profile/Ba_Son_Thai/publication/308692177_A_Fast_White_Balance_Algorithm_Based_on_Pixel_Greyness/
-
-      Edge-Based Color Constancy, Joost van de Weijer, Theo Gevers, Arjan Gijsenij
-      https://hal.inria.fr/inria-00548686/document
-    */
-    const float D50[2] = { D50xyY.x, D50xyY.y };
-// Convert RGB to xy
-  DT_OMP_FOR(collapse(2))
-  for(size_t i = 0; i < height; i++)
-    for(size_t j = 0; j < width; j++)
-    {
-      const size_t index = (i * width + j) * ch;
-      dt_aligned_pixel_t RGB;
-      dt_aligned_pixel_t XYZ;
-
-      // Clip negatives
-      for_each_channel(c,aligned(in))
-        RGB[c] = fmaxf(in[index + c], 0.0f);
-
-      // Convert to XYZ
-      dot_product(RGB, RGB_to_XYZ, XYZ);
-
-      // Convert to xyY
-      const float sum = fmaxf(XYZ[0] + XYZ[1] + XYZ[2], NORM_MIN);
-      XYZ[0] /= sum;   // x
-      XYZ[2] = XYZ[1]; // Y
-      XYZ[1] /= sum;   // y
-
-      // Shift the chromaticity plane so the D50 point (target) becomes the origin
-      const float norm = dt_fast_hypotf(D50[0], D50[1]);
-
-      temp[index    ] = (XYZ[0] - D50[0]) / norm;
-      temp[index + 1] = (XYZ[1] - D50[1]) / norm;
-      temp[index + 2] =  XYZ[2];
-    }
-
-  float elements = 0.f;
-  dt_aligned_pixel_t xyY = { 0.f };
-
-  if(illuminant == DT_ILLUMINANT_DETECT_SURFACES)
-  {
-    DT_OMP_FOR(reduction(+:xyY, elements))
-    for(size_t i = 2 * OFF; i < height - 4 * OFF; i += OFF)
-      for(size_t j = 2 * OFF; j < width - 4 * OFF; j += OFF)
-      {
-        float DT_ALIGNED_PIXEL central_average[2];
-
-        #pragma unroll
-        for(size_t c = 0; c < 2; c++)
-        {
-          // B-spline local average / blur
-          central_average[c] = (temp[SHF(-OFF, -OFF, c)]
-                                + 2.f * temp[SHF(-OFF, 0, c)]
-                                + temp[SHF(-OFF, +OFF, c)]
-                                + 2.f * temp[SHF(   0, -OFF, c)]
-                                + 4.f * temp[SHF(   0, 0, c)]
-                                + 2.f * temp[SHF(   0, +OFF, c)]
-                                + temp[SHF(+OFF, -OFF, c)]
-                                + 2.f * temp[SHF(+OFF, 0, c)]
-                                + temp[SHF(+OFF, +OFF, c)]) / 16.0f;
-          central_average[c] = fmaxf(central_average[c], 0.0f);
-        }
-
-        dt_aligned_pixel_t var = { 0.f };
-
-        // compute patch-wise variance
-        // If variance = 0, we are on a flat surface and want to discard that patch.
-        #pragma unroll
-        for(size_t c = 0; c < 2; c++)
-        {
-          var[c] = (  sqf(temp[SHF(-OFF, -OFF, c)] - central_average[c])
-                    + sqf(temp[SHF(-OFF,    0, c)] - central_average[c])
-                    + sqf(temp[SHF(-OFF, +OFF, c)] - central_average[c])
-                    + sqf(temp[SHF(0,    -OFF, c)] - central_average[c])
-                    + sqf(temp[SHF(0,       0, c)] - central_average[c])
-                    + sqf(temp[SHF(0,    +OFF, c)] - central_average[c])
-                    + sqf(temp[SHF(+OFF, -OFF, c)] - central_average[c])
-                    + sqf(temp[SHF(+OFF,    0, c)] - central_average[c])
-                    + sqf(temp[SHF(+OFF, +OFF, c)] - central_average[c])
-                    ) / 9.0f;
-        }
-
-        // Compute the patch-wise chroma covariance.
-        // If covariance = 0, chroma channels are not correlated and we either have noise or chromatic aberrations.
-        // Both ways, we want to discard that patch from the chroma average.
-        var[2] = ((temp[SHF(-OFF, -OFF, 0)] - central_average[0]) * (temp[SHF(-OFF, -OFF, 1)] - central_average[1]) +
-                  (temp[SHF(-OFF,    0, 0)] - central_average[0]) * (temp[SHF(-OFF,    0, 1)] - central_average[1]) +
-                  (temp[SHF(-OFF, +OFF, 0)] - central_average[0]) * (temp[SHF(-OFF, +OFF, 1)] - central_average[1]) +
-                  (temp[SHF(   0, -OFF, 0)] - central_average[0]) * (temp[SHF(   0, -OFF, 1)] - central_average[1]) +
-                  (temp[SHF(   0,    0, 0)] - central_average[0]) * (temp[SHF(   0,    0, 1)] - central_average[1]) +
-                  (temp[SHF(   0, +OFF, 0)] - central_average[0]) * (temp[SHF(   0, +OFF, 1)] - central_average[1]) +
-                  (temp[SHF(+OFF, -OFF, 0)] - central_average[0]) * (temp[SHF(+OFF, -OFF, 1)] - central_average[1]) +
-                  (temp[SHF(+OFF,    0, 0)] - central_average[0]) * (temp[SHF(+OFF,    0, 1)] - central_average[1]) +
-                  (temp[SHF(+OFF, +OFF, 0)] - central_average[0]) * (temp[SHF(+OFF, +OFF, 1)] - central_average[1])
-          ) / 9.0f;
-
-        // Compute the Minkowski p-norm for regularization
-        const float p = 8.f;
-        const float p_norm
-            = powf(powf(fabsf(central_average[0]), p)
-                   + powf(fabsf(central_average[1]), p), 1.f / p) + NORM_MIN;
-        const float weight = var[0] * var[1] * var[2];
-
-        #pragma unroll
-        for(size_t c = 0; c < 2; c++) xyY[c] += central_average[c] * weight / p_norm;
-        elements += weight / p_norm;
-      }
-  }
-  else if(illuminant == DT_ILLUMINANT_DETECT_EDGES)
-  {
-    DT_OMP_FOR(reduction(+:xyY, elements))
-    for(size_t i = 2 * OFF; i < height - 4 * OFF; i += OFF)
-      for(size_t j = 2 * OFF; j < width - 4 * OFF; j += OFF)
-      {
-        float DT_ALIGNED_PIXEL dd[2];
-        float DT_ALIGNED_PIXEL central_average[2];
-
-        #pragma unroll
-        for(size_t c = 0; c < 2; c++)
-        {
-          // B-spline local average / blur
-          central_average[c] = (temp[SHF(-OFF, -OFF, c)]
-                                + 2.f * temp[SHF(-OFF, 0, c)]
-                                + temp[SHF(-OFF, +OFF, c)]
-                                + 2.f * temp[SHF(   0, -OFF, c)]
-                                + 4.f * temp[SHF(   0, 0, c)]
-                                + 2.f * temp[SHF(   0, +OFF, c)]
-                                + temp[SHF(+OFF, -OFF, c)]
-                                + 2.f * temp[SHF(+OFF, 0, c)]
-                                + temp[SHF(+OFF, +OFF, c)]) / 16.0f;
-
-          // image - blur = laplacian = edges
-          dd[c] = temp[SHF(0, 0, c)] - central_average[c];
-        }
-
-        // Compute the Minkowski p-norm for regularization
-        const float p = 8.f;
-        const float p_norm = powf(powf(fabsf(dd[0]), p)
-                                  + powf(fabsf(dd[1]), p), 1.f / p) + NORM_MIN;
-
-#pragma unroll
-        for(size_t c = 0; c < 2; c++) xyY[c] -= dd[c] / p_norm;
-        elements += 1.f;
-      }
-  }
-
-  const float norm_D50 = dt_fast_hypotf(D50[0], D50[1]);
-
-  for(size_t c = 0; c < 2; c++)
-    xyz[c] = norm_D50 * (xyY[c] / elements) + D50[c];
+  dt_channelmixerrgb_auto_detect_wb(in, temp, illuminant, width, height, ch,
+                                    RGB_to_XYZ, xyz);
 }
 
-#if defined(__GNUC__) && defined(_WIN32)
-  #pragma GCC pop_options
-#endif
-
-#endif // AI_ACTIVATED
+static inline void _check_if_close_to_daylight(const float x,
+                                               const float y,
+                                               float *temperature,
+                                               dt_illuminant_t *illuminant,
+                                               dt_adaptation_t *adaptation)
+{
+  dt_channelmixerrgb_check_if_close_to_daylight(
+      x, y, temperature, illuminant, adaptation);
+}
 
 static void _declare_cat_on_pipe(dt_iop_module_t *self, const gboolean preset)
 {
@@ -1218,77 +1063,6 @@ static void _update_illuminants(const dt_iop_module_t *self);
 static void _update_approx_cct(const dt_iop_module_t *self);
 static void _update_illuminant_color(const dt_iop_module_t *self);
 
-static void _check_if_close_to_daylight(const float x,
-                                        const float y,
-                                        float *temperature,
-                                        dt_illuminant_t *illuminant,
-                                        dt_adaptation_t *adaptation)
-{
-  /* Check if a chromaticity x, y is close to daylight within 2.5 % error margin.
-   * If so, we enable the daylight GUI for better ergonomics
-   * Otherwise, we default to direct x, y control for better accuracy
-   *
-   * Note : The use of CCT is discouraged if dE > 5 % in CIE 1960 Yuv space
-   *        reference : https://onlinelibrary.wiley.com/doi/abs/10.1002/9780470175637.ch3
-   */
-
-  // Get the correlated color temperature (CCT)
-  float t = xy_to_CCT(x, y);
-
-  // xy_to_CCT is valid only in 3000 - 25000 K. We need another model below
-  if(t < 3000.f && t > 1667.f)
-    t = CCT_reverse_lookup(x, y);
-
-  if(temperature)
-    *temperature = t;
-
-  // Convert to CIE 1960 Yuv space
-  const float xy_ref[2] = { x, y };
-  float uv_ref[2];
-  xy_to_uv(xy_ref, uv_ref);
-
-  float xy_test[2] = { 0.f };
-  float uv_test[2];
-
-  // Compute the test chromaticity from the daylight model
-  illuminant_to_xy(DT_ILLUMINANT_D, NULL, NULL, &xy_test[0], &xy_test[1], t,
-                   DT_ILLUMINANT_FLUO_LAST, DT_ILLUMINANT_LED_LAST);
-  xy_to_uv(xy_test, uv_test);
-
-  // Compute the error between the reference illuminant and the test
-  // illuminant derivated from the CCT with daylight model
-  const float delta_daylight = dt_fast_hypotf(uv_test[0] - uv_ref[0], uv_test[1] - uv_ref[1]);
-
-  // Compute the test chromaticity from the blackbody model
-  illuminant_to_xy(DT_ILLUMINANT_BB, NULL, NULL, &xy_test[0], &xy_test[1], t,
-                   DT_ILLUMINANT_FLUO_LAST, DT_ILLUMINANT_LED_LAST);
-  xy_to_uv(xy_test, uv_test);
-
-  // Compute the error between the reference illuminant and the test
-  // illuminant derivated from the CCT with black body model
-  const float delta_bb = dt_fast_hypotf(uv_test[0] - uv_ref[0], uv_test[1] - uv_ref[1]);
-
-  // Check the error between original and test chromaticity
-  if(delta_bb < 0.005f || delta_daylight < 0.005f)
-  {
-    if(illuminant)
-    {
-      if(delta_bb < delta_daylight)
-        *illuminant = DT_ILLUMINANT_BB;
-      else
-        *illuminant = DT_ILLUMINANT_D;
-    }
-  }
-  else
-  {
-    // error is too big to use a CCT-based model, we fall back to a
-    // custom/freestyle chroma selection for the illuminant
-    if(illuminant) *illuminant = DT_ILLUMINANT_CUSTOM;
-  }
-
-  // CAT16 is more accurate no matter the illuminant
-  if(adaptation) *adaptation = DT_ADAPTATION_CAT16;
-}
 
 static inline void _compute_patches_delta_E(const float *const restrict patches,
                                             const dt_color_checker_t *const checker,

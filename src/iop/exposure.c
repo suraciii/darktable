@@ -39,6 +39,7 @@
 #include "gui/presets.h"
 #include "gui/color_picker_proxy.h"
 #include "iop/iop_api.h"
+#include "iop/exposure.h"
 
 // 'white' is the value that is mapped to 1.0 after exposure correction
 #define exposure2white(x) exp2f(-(x))
@@ -437,38 +438,74 @@ static double _raw_to_ev(const uint32_t raw,
   return raw_ev;
 }
 
-static void _compute_deflicker_correction(dt_iop_exposure_params_t *p,
-                                dt_dev_pixelpipe_t *pipe,
-                                const uint32_t *const histogram,
-                                const dt_dev_histogram_stats_t *const histogram_stats,
-                                float *correction)
+static gboolean _compute_deflicker_correction(dt_iop_exposure_params_t *p,
+                                              uint32_t raw_black_level,
+                                              uint32_t raw_white_point,
+                                              const uint32_t *const histogram,
+                                              const dt_dev_histogram_stats_t *const histogram_stats,
+                                              float *correction)
 {
-  // preserve caller's correction if we cannot compute anything
-  if(histogram == NULL) return;
+  if(!p || !histogram || !histogram_stats || !correction
+     || histogram_stats->bins_count == 0 || histogram_stats->pixels == 0
+     || raw_white_point <= raw_black_level)
+    return FALSE;
 
-  const double thr
-      = CLAMP(((double)histogram_stats->pixels * (double)p->deflicker_percentile
-               / (double)100.0), 0.0, (double)histogram_stats->pixels);
-
+  const double thr = CLAMP((double)histogram_stats->pixels
+                               * (double)p->deflicker_percentile / 100.0,
+                           1.0, (double)histogram_stats->pixels);
   size_t n = 0;
   uint32_t raw = 0;
-
+  gboolean found = FALSE;
   for(size_t i = 0; i < histogram_stats->bins_count; i++)
   {
     n += histogram[i];
-
     if((double)n >= thr)
     {
-      raw = i;
+      raw = (uint32_t)i;
+      found = TRUE;
       break;
     }
   }
+  if(!found) return FALSE;
 
-  const double ev
-      = _raw_to_ev(raw, (uint32_t)pipe->dsc.rawprepare.raw_black_level,
-                   pipe->dsc.rawprepare.raw_white_point);
+  const double ev = _raw_to_ev(raw, raw_black_level, raw_white_point);
+  const double value = (double)p->deflicker_target_level - ev;
+  if(!isfinite(value)) return FALSE;
+  *correction = (float)value;
+  return isfinite(*correction);
+}
 
-  *correction = p->deflicker_target_level - ev;
+
+gboolean dt_iop_exposure_compute_deflicker(dt_iop_module_t *self, float *correction)
+{
+  if(!self || !self->dev || !correction
+     || !dt_image_is_raw(&self->dev->image_storage)
+     || self->dev->image_storage.buf_dsc.channels != 1
+     || self->dev->image_storage.buf_dsc.datatype != TYPE_UINT16)
+    return FALSE;
+
+  dt_iop_exposure_params_t *params = self->params;
+  uint32_t *histogram = NULL;
+  dt_dev_histogram_stats_t histogram_stats = { 0 };
+  _deflicker_prepare_histogram(self, &histogram, &histogram_stats);
+  if(!histogram) return FALSE;
+  float computed = params->exposure;
+  const gboolean ok = _compute_deflicker_correction(
+      params, self->dev->image_storage.raw_black_level,
+      self->dev->image_storage.raw_white_point, histogram,
+      &histogram_stats, &computed);
+  dt_free_align(histogram);
+  if(!ok) return FALSE;
+  *correction = computed;
+  return TRUE;
+}
+
+void dt_iop_exposure_set_manual(dt_iop_module_t *self, float exposure)
+{
+  if(!self || !self->params) return;
+  dt_iop_exposure_params_t *params = self->params;
+  params->mode = EXPOSURE_MODE_MANUAL;
+  params->exposure = exposure;
 }
 
 static gboolean _show_computed(gpointer user_data);
@@ -488,7 +525,9 @@ static void _process_common_setup(dt_iop_module_t *self,
     if(g)
     {
       // histogram is precomputed and cached
-      _compute_deflicker_correction(&d->params, piece->pipe,
+      _compute_deflicker_correction(&d->params,
+                          piece->pipe->dsc.rawprepare.raw_black_level,
+                          piece->pipe->dsc.rawprepare.raw_white_point,
                           g->deflicker_histogram, &g->deflicker_histogram_stats,
                           &exposure);
     }
@@ -497,8 +536,11 @@ static void _process_common_setup(dt_iop_module_t *self,
       uint32_t *histogram = NULL;
       dt_dev_histogram_stats_t histogram_stats;
       _deflicker_prepare_histogram(self, &histogram, &histogram_stats);
-      _compute_deflicker_correction(&d->params, piece->pipe, histogram,
-                          &histogram_stats, &exposure);
+      if(!_compute_deflicker_correction(
+             &d->params, piece->pipe->dsc.rawprepare.raw_black_level,
+             piece->pipe->dsc.rawprepare.raw_white_point, histogram,
+             &histogram_stats, &exposure))
+        exposure = d->params.exposure;
       dt_free_align(histogram);
     }
 

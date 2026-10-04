@@ -20,6 +20,7 @@ FILE(GLOB SOURCE_FILES
   "bauhaus/bauhaus.c"
   "common/act_on.c"
   "common/atomic.c"
+  "common/automatic_adjustments.c"
   "common/bilateral.c"
   "common/bilateralcl.c"
   "common/bilinear.c"
